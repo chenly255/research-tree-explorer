@@ -170,19 +170,29 @@ A single autopilot step does this:
 
 ```
 1. Read progress: tail -1 .research-tree/progress.log (so you know what last step did)
-2. Check budget:
+2. Check for previously-detected root failure:
+     if .research-tree/ROOT_FAILURE.md exists:
+       Tell the user: every approach under root is dead. Show ROOT_FAILURE.md's
+       content. Recommend: archive the tree (mv .research-tree .research-tree.failed-DATE)
+       and re-run /idea-pipeline with the dead-branch reasons as input. STOP — do not
+       auto-loop further. The /loop wrapper should also stop when this file is present.
+
+3. Check budget:
      python3 "$TREE_STATE" budget-check
    If exit non-zero → run synthesize, report "budget exhausted", stop.
 
-3. Pick the next leaf:
+4. Pick the next leaf:
      next_id=$(python3 "$TREE_STATE" pick-next)
-   If next_id == "NONE" → run synthesize, report "all alive leaves exhausted, tree converged", stop.
+   If next_id == "NONE" → run synthesize, then read the new FINAL_REPORT.md's
+   "Suggested next move" section and surface those options verbatim to the user
+   (deepen winner / resolve alive / write paper via ARIS, OR pivot if all root dead).
+   STOP.
 
-4. Get its state:
+5. Get its state:
      node_json=$(python3 "$TREE_STATE" get "$next_id")
    Parse "status" from JSON.
 
-5. Dispatch ONE action based on status:
+6. Dispatch ONE action based on status:
      - pending (never touched)        → invoke /research-tree expand "$next_id"
      - expanded (has children)        → invoke /research-tree execute on its first pending grandchild
                                        (this normally won't happen; pick-next prefers pending leaves)
@@ -191,24 +201,29 @@ A single autopilot step does this:
    Each of these subcommands does its own subagent dispatch internally. autopilot
    does NOT run multiple subagents in one step. One step = one orchestrated action.
 
-6. Every 3 invocations, check for junctions needing audit:
+7. Every 3 invocations, check for junctions needing audit:
      loop_count=$(wc -l < .research-tree/progress.log)
      if loop_count % 3 == 0:
        for each junction with ≥1 completed AND ≥1 dead child AND no junction_audit_id yet:
          invoke /research-tree audit <junction_id>
    (Audit itself spawns codex fresh thread — no main context bloat.)
 
-7. Every 5 invocations, force a self-audit reflection — write to .research-tree/reflections/<N>.md:
+8. Every 5 invocations, force a self-audit reflection — write to .research-tree/reflections/<N>.md:
      "Am I picking the easiest branches because they're easy, or because they're the most
       informative? Are the dead branches dying for the right reasons or because the pilot
       was sloppy? Has the root idea drifted?"
    Answer honestly in 3 sentences. If sloppy, queue a re-run by setting affected nodes
    back to pending.
 
-8. Append progress.log:
+9. Run synthesize at the end of every step (cheap, idempotent):
+     python3 "$SYNTHESIZE" --project-root "$(pwd)"
+   This may write a ROOT_FAILURE.md if all root branches died. If it does, surface
+   that to the user and STOP — recommend running /idea-pipeline with the dead reasons.
+
+10. Append progress.log:
      echo "$(date -Iseconds)  step=$loop_count  action=<expand|execute|audit|reflect>  node=$next_id  alive=$alive_count  completed=$completed_count  dead=$dead_count" >> .research-tree/progress.log
 
-9. Report ONE PARAGRAPH to the user: what you did this step, what the tree looks like now
+11. Report ONE PARAGRAPH to the user: what you did this step, what the tree looks like now
    (`python3 "$TREE_STATE" tree | head -20`), what `/research-tree autopilot` will do next time.
    Then STOP. Do not loop in-prompt.
 ```

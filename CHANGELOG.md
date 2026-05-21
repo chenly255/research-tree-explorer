@@ -2,22 +2,29 @@
 
 All notable changes to this project will be documented here.
 
-## [0.1.0] — 2026-05-21
+## [0.1.1] — 2026-05-21
 
-Initial public release.
+Tighter integration with sibling skills (idea-pipeline upstream, ARIS downstream)
+without expanding scope. The skill now acts as a clean middle layer in the
+fractal research workflow.
 
 ### Added
-- `/research-tree` skill with subcommands: `init`, `expand`, `execute`, `audit`, `prune`, `status`, `synthesize`, `autopilot`, `resume`
-- `scripts/tree_state.py` — state machine CLI for the tree (JSON-backed, atomic writes)
-- `scripts/synthesize_report.py` — FINAL_REPORT.md generator covering winners, dead-branch atlas, junction audits, suggested next move
-- `scripts/install.sh` — symlinks skill into `~/.claude/skills/research-tree` and exports `RESEARCH_TREE_REPO` env
-- Branch-proposer subagent pattern: `/research-tree expand` spawns an isolated agent to generate candidates so the main orchestrator's context stays clean
-- Single-step `autopilot` semantics: each invocation does one orchestration action and returns; continuous runs are produced by wrapping with the external `/loop` skill
-- Junction audit via `mcp__codex__codex` in fresh threads (never `codex-reply`)
-- `.research-tree/progress.log` — append-only orchestration log that survives context compaction and session restart
-- `.research-tree/reflections/` — periodic self-audit notes (every 5 autopilot steps)
-- `max_branches_per_junction` caps alive children only; dead branches free their slot
-- `examples/toy_classification/` — end-to-end smoke test with 4 classifier branches + 1 ablation + 1 junction audit
-- `tests/test_tree_state.sh` — state-machine unit/smoke tests
-- `docs/ARCHITECTURE.md` — design rationale, three-layer model, subagent boundaries, state schema
-- `CONTRIBUTING.md` — how to extend or fix the project
+- Three-way handoff at tree convergence in `FINAL_REPORT.md` Suggested next move:
+  (a) deepen the winner further, (b) resolve remaining alive branches first,
+  (c) hand off to ARIS `/paper-writing` with winner + dead-branch atlas
+- Automatic root-failure detection: when all direct children of root are dead,
+  the synthesizer writes `.research-tree/ROOT_FAILURE.md` and the `FINAL_REPORT.md`
+  Suggested next move switches to PIVOT mode (archive tree, re-run idea-pipeline)
+- `autopilot` now runs `synthesize` at the end of every step (idempotent, cheap)
+  so root-failure and 3-way handoff trigger immediately, not just when the user
+  manually runs synthesize
+- `autopilot` checks for `ROOT_FAILURE.md` at the start of each step and stops
+  with a clear recommendation if it exists
+
+### Changed
+- Renumbered the autopilot step sequence (1-11) for clarity
+- Better SKILL.md prose around how the tool fits with sibling skills
+
+## [0.1.0] — 2026-05-21
+
+Initial public release. See git log for full feature list.

@@ -152,24 +152,89 @@ def main() -> None:
                 lines.append(f"  - trace: `{a['trace_file']}`")
         lines.append("")
 
+    # Root-failure detection: all direct children of root are dead.
+    root_node = nodes["root"]
+    root_children = [nodes[c] for c in root_node["children"]]
+    all_root_dead = bool(root_children) and all(c["status"] == "dead" for c in root_children)
+
     lines.append("## Suggested next move")
     lines.append("")
-    if completed:
-        winner = completed[0]
+
+    if all_root_dead:
+        # Pivot path — write ROOT_FAILURE.md too so the autopilot loop can detect it.
         lines.append(
-            f"Deepen `{winner['id']}` further (e.g., ablations, scaling-up, baselines). "
-            f"Its current artifacts at `{winner.get('branch_dir', 'N/A')}/` are the strongest "
-            f"foundation for the paper draft."
+            "**PIVOT** — every approach under root is dead. The current idea is unlikely to "
+            "work as framed. Suggested action:"
+        )
+        lines.append("")
+        lines.append(
+            "1. Read the dead-branch atlas above; the failure modes are the next idea's anti-targets.")
+        lines.append(
+            "2. Archive this tree: `mv .research-tree .research-tree.failed-$(date +%Y%m%d)`")
+        lines.append(
+            "3. Re-run `/idea-pipeline` with the dead-branch reasons as input; it will refine "
+            "the idea to dodge what we just learned.")
+        lines.append(
+            "4. The refreshed `RESEARCH_BRIEF.md` will then feed a new `/research-tree init`.")
+        lines.append("")
+        root_failure_path = root / STATE_DIR_NAME / "ROOT_FAILURE.md"
+        root_failure_path.write_text(
+            f"# Root-level failure detected\n\n"
+            f"All {len(root_children)} direct children of root are dead. "
+            f"This idea is not making forward progress.\n\n"
+            f"See FINAL_REPORT.md \"What died\" section for dead-branch atlas.\n\n"
+            f"Recommended action: re-run /idea-pipeline with these reasons as input.\n"
+        )
+        print(f"OK: also wrote ROOT_FAILURE.md to {root_failure_path}")
+    elif completed:
+        winner = completed[0]
+        winner_dir = winner.get("branch_dir", "N/A")
+        threshold_strong = winner["score"] is not None and winner["score"] >= 0.80
+        lines.append(
+            f"Winner so far: **`{winner['id']}` — {winner['title']}** (score "
+            f"{winner['score']:.2f}). Three live options, pick by current goal:"
+        )
+        lines.append("")
+        lines.append(
+            f"**(a) Deepen the winner** — open ablations / scale-up / baseline sub-branches "
+            f"under `{winner['id']}`. Use `/research-tree expand {winner['id']}` or just "
+            f"`/research-tree autopilot`. Pick this if you're not yet sure the winner is "
+            f"publishable-strong."
+        )
+        if alive:
+            lines.append("")
+            lines.append(
+                f"**(b) Resolve remaining alive branches first** — {len(alive)} branches are "
+                f"still pending. Running them gives a fairer junction picture and may unseat "
+                f"the current winner."
+            )
+        lines.append("")
+        paper_strength = "looks strong" if threshold_strong else "may not be strong enough yet"
+        lines.append(
+            f"**(c) Transition to paper writing** — the winner {paper_strength}. Hand off to "
+            f"ARIS:"
+        )
+        lines.append("")
+        lines.append("```")
+        lines.append(f"/paper-writing \"draft a paper around the winner at {winner_dir}, "
+                     f"using the dead-branch atlas in .research-tree/FINAL_REPORT.md as "
+                     f"supplementary material\"")
+        lines.append("```")
+        lines.append("")
+        lines.append(
+            "Or `/auto-review-loop` first if you want adversarial review before drafting."
         )
     elif alive:
         lines.append(
-            f"All branches either dead or in progress. Resume by running "
-            f"`/research-tree autopilot` to keep extending the tree."
+            f"All branches either pending or in progress ({len(alive)} alive). Resume by "
+            f"running `/research-tree autopilot` to keep extending the tree. If you've been "
+            f"running for a while without new `completed` nodes, consider auditing the "
+            f"oldest running branch — it may be stuck."
         )
     else:
         lines.append(
-            "Every branch died. Consider re-rooting with a refined research direction — "
-            "consult the dead-branch atlas above to avoid repeating mistakes."
+            "Tree is empty or in an unexpected state. If this is a fresh init, run "
+            "`/research-tree autopilot` to expand root."
         )
     lines.append("")
 
