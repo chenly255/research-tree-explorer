@@ -1,0 +1,14 @@
+refs/
+*.pyc
+__pycache__/
+.venv/
+venv/
+.DS_Store
+*.log
+.research-tree-state/
+.research-tree/
+node_modules/
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
