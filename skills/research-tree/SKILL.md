@@ -1,6 +1,6 @@
 ---
 name: research-tree
-description: "Autonomous tree-shaped research exploration for Claude Code. Instead of running a research idea linearly, this skill branches at every major decision point (architecture, experiment design, narrative angle), runs each branch as an isolated subagent, audits junctions with a cross-model reviewer (codex), prunes dead branches with recorded reasons, and synthesizes a final report from the whole tree. Use when the user says '树状探索', 'research tree', 'tree exploration', 'autonomous research', 'idea落地全流程', or invokes /research-tree explicitly. Designed for long-running runs (hours to days) with cross-session resume via .research-tree/tree.json. The skill picks branches itself — never asks the user which technical fork to take."
+description: "Autonomous tree-shaped research exploration for Claude Code. Instead of running a research idea linearly, this skill branches at every major decision point (architecture, experiment design, narrative angle), runs each branch as an isolated subagent, audits junctions with a cross-model reviewer (codex), prunes dead branches with recorded reasons, and synthesizes a final report from the whole tree. Use when the user says '树状探索', 'research tree', 'tree exploration', 'autonomous research', 'idea落地全流程', or invokes /research-tree explicitly. Designed for long-running runs (hours to days). **autopilot is SINGLE-STEP** — each invocation does one orchestration action and returns; wrap with the /loop skill (e.g. `/loop 30m /research-tree autopilot`) for continuous runs so main context stays clean. State persists in .research-tree/tree.json + progress.log across sessions. The skill picks branches itself — never asks the user which technical fork to take."
 argument-hint: "<subcommand> [args] — see SUBCOMMANDS section. Common: init '<idea>', autopilot, expand <node>, execute <node>, audit <node>, status, synthesize"
 allowed-tools: Bash(*), Read, Write, Edit, Grep, Glob, Agent, Skill, mcp__codex__codex, mcp__tavily__tavily_search
 ---
@@ -64,23 +64,40 @@ After init, print one paragraph to the user: "Tree initialized with root idea '<
 
 ### expand
 
-Generate 2-4 candidate child branches for a node. This is where the tree branches.
+Generate 2-4 candidate child branches for a node. **This work goes into a subagent so your main context stays clean.**
 
-1. Read the parent node: `python3 "$TREE_STATE" get <node_id>`
-2. Read `RESEARCH_BRIEF.md` (if present) and the parent node's `description`.
-3. **Choose what kind of branching this junction calls for**, based on parent's `depth` and `kind`:
-   - depth 0 (root): branch on **approach families** (e.g., set transformer vs perceiver vs pointnet vs mean-pool)
+1. Read the parent node and its existing children to ground the proposer:
+   ```bash
+   python3 "$TREE_STATE" get <node_id> > /tmp/rt_parent.json
+   python3 "$TREE_STATE" list > /tmp/rt_siblings.txt
+   ```
+2. Decide what KIND of branching this junction calls for, based on parent's `depth`:
+   - depth 0 (root): branch on **approach families** (set transformer vs perceiver vs gnn vs cnn)
    - depth 1: branch on **architecture details** within the approach
    - depth 2: branch on **experimental design** (datasets, scales, baselines)
    - depth 3: branch on **narrative angle** (which claim to lead with)
    - depth 4: branch on **ablations to lock in the story**
-4. **Generate the candidates yourself** — think hard, use Tavily to scan recent literature if helpful, but do not stop to ask the user. Aim for candidates that are **mutually distinct** (not three flavors of the same idea) and **diverse in expected outcome** (one safe, one ambitious, one weird).
-5. For each candidate, run:
+3. **Spawn an Agent (subagent_type=general-purpose) — the branch-proposer.** Hand it a self-contained prompt:
+   - paste the parent node JSON (small)
+   - paste the sibling list (small)
+   - paste RESEARCH_BRIEF.md if it exists
+   - state the kind of branching expected (from step 2)
+   - tell it: "Propose 2-4 candidate sub-branches. Each must be mutually distinct from the others and from existing siblings (no two flavors of the same idea). Aim for diversity in expected outcome: one safe, one ambitious, one weird. You may use Tavily to scan recent literature if it helps you tell mutually distinct from redundant — but cap the search at 2 queries."
+   - tell it: "Return ONLY a JSON array. No prose. Schema:
+     ```json
+     [{"kind": "approach|architecture|experiment|ablation|narrative|custom", "title": "<≤80 chars>", "description": "<2-4 sentences explaining the rationale and what 'success' would look like for this branch>"}]
+     ```"
+   - tell it: "Report cap: just the JSON. Anything else wastes the orchestrator's context."
+4. Parse the returned JSON. For each candidate, run:
    ```bash
-   python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<2-4 sentence rationale>"
+   python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<description>"
    ```
-6. Optionally invoke `mcp__codex__codex` with a fresh thread to red-team the candidate list before locking it in (do NOT use codex-reply — fresh thread only). Pass codex only file paths to read, never your own interpretation. If codex flags a candidate as "redundant" or "obviously dominated", remove it via `set status=dead death_reason=...` before moving on.
-7. Print the resulting subtree with `python3 "$TREE_STATE" tree`.
+5. (Optional, only if `mcp__codex__codex` is available) Spawn a codex fresh-thread red-team: pass the file paths `/tmp/rt_parent.json` + `/tmp/rt_siblings.txt` + the new children's ids, ask "any of these mutually redundant or obviously dominated?". Apply via `set status=dead death_reason=...` before continuing. **Never use codex-reply — fresh thread only.**
+6. Log the action:
+   ```bash
+   echo "$(date -Iseconds)  expand <node_id>  added <count>  alive=$(python3 "$TREE_STATE" list --status pending | wc -l)" >> .research-tree/progress.log
+   ```
+7. Print the resulting subtree with `python3 "$TREE_STATE" tree` and stop. Return a one-sentence summary to the user.
 
 ### execute
 
@@ -147,60 +164,64 @@ Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights t
 
 ### autopilot / resume
 
-The main loop. This is where the skill earns its keep — the user runs `autopilot` once and the tree grows until it converges or hits a budget.
+**`autopilot` is a single-step command, not a long-running loop.** Each invocation does ONE unit of work and returns. To run continuously, the user wraps it with the external `/loop` skill, e.g. `/loop 30m /research-tree autopilot`. This keeps your main context fresh — each step is one orchestration turn, heavy work is in subagents, no in-prompt for-loops that bloat over time.
+
+A single autopilot step does this:
 
 ```
-loop_count = 0
-while loop_count < max_loops:
-    loop_count += 1
+1. Read progress: tail -1 .research-tree/progress.log (so you know what last step did)
+2. Check budget:
+     python3 "$TREE_STATE" budget-check
+   If exit non-zero → run synthesize, report "budget exhausted", stop.
 
-    # 1. Check global budget. If over, stop.
-    if `python3 "$TREE_STATE" budget-check` exits non-zero:
-        break with reason="budget_exhausted"
+3. Pick the next leaf:
+     next_id=$(python3 "$TREE_STATE" pick-next)
+   If next_id == "NONE" → run synthesize, report "all alive leaves exhausted, tree converged", stop.
 
-    # 2. Pick the next leaf to work on.
-    next_id = `python3 "$TREE_STATE" pick-next`
-    if next_id == "NONE":
-        break with reason="no_alive_leaves"
+4. Get its state:
+     node_json=$(python3 "$TREE_STATE" get "$next_id")
+   Parse "status" from JSON.
 
-    # 3. Branch on the leaf's status:
-    node = `python3 "$TREE_STATE" get <next_id>`
-    if node.status == "pending":
-        # not yet expanded — expand it
-        invoke /research-tree expand <next_id>
-    elif node.status == "expanded":
-        # has children — pick one of its children's pending leaves
-        # (this case is naturally handled by pick-next next iter)
-        continue
-    elif node.status in ("completed", "dead"):
-        # shouldn't be picked, but defensively skip
-        continue
+5. Dispatch ONE action based on status:
+     - pending (never touched)        → invoke /research-tree expand "$next_id"
+     - expanded (has children)        → invoke /research-tree execute on its first pending grandchild
+                                       (this normally won't happen; pick-next prefers pending leaves)
+     - any other unexpected state     → log and stop
 
-    # 4. After every K loops (default K=3), audit all junctions with mixed-status children.
-    if loop_count % 3 == 0:
-        for each junction with at least one completed and one dead child:
-            invoke /research-tree audit <junction_id>
+   Each of these subcommands does its own subagent dispatch internally. autopilot
+   does NOT run multiple subagents in one step. One step = one orchestrated action.
 
-    # 5. After each loop, write a one-line progress marker to .research-tree/progress.log
-    #    with timestamp + loop_count + tree stats. This survives context compaction.
+6. Every 3 invocations, check for junctions needing audit:
+     loop_count=$(wc -l < .research-tree/progress.log)
+     if loop_count % 3 == 0:
+       for each junction with ≥1 completed AND ≥1 dead child AND no junction_audit_id yet:
+         invoke /research-tree audit <junction_id>
+   (Audit itself spawns codex fresh thread — no main context bloat.)
 
-# Done. Synthesize.
-invoke /research-tree synthesize
-print 3-sentence summary to user.
+7. Every 5 invocations, force a self-audit reflection — write to .research-tree/reflections/<N>.md:
+     "Am I picking the easiest branches because they're easy, or because they're the most
+      informative? Are the dead branches dying for the right reasons or because the pilot
+      was sloppy? Has the root idea drifted?"
+   Answer honestly in 3 sentences. If sloppy, queue a re-run by setting affected nodes
+   back to pending.
+
+8. Append progress.log:
+     echo "$(date -Iseconds)  step=$loop_count  action=<expand|execute|audit|reflect>  node=$next_id  alive=$alive_count  completed=$completed_count  dead=$dead_count" >> .research-tree/progress.log
+
+9. Report ONE PARAGRAPH to the user: what you did this step, what the tree looks like now
+   (`python3 "$TREE_STATE" tree | head -20`), what `/research-tree autopilot` will do next time.
+   Then STOP. Do not loop in-prompt.
 ```
 
-**Pacing and self-checks** (PUA against laziness):
-
-- After every 5 loops, force a self-audit: "Am I picking the easiest branches because they're easy, or because they're the most informative? Are the dead branches dying for the right reasons or because the pilot was sloppy?" If sloppy, re-run those branches.
-- After every 10 loops, force a global reflection: "Has the root idea drifted? Is the tree still answering the original question?" Update root node's description if the framing has evolved.
-- Never silently lower the bar. If a branch keeps failing, recording WHY is the deliverable — do not declare success on a half-done branch.
+**Why single-step**: each autopilot invocation is a fresh orchestration turn. Subagents handle the heavy expand / execute / audit work in isolated contexts. The main context never accumulates more than one step's worth of state — it reads from disk (`tree.json`, `progress.log`) at the start, dispatches one action, writes back to disk, returns. This is the same pattern as GSD's `gsd-autonomous` and is the only way to truly run for days without context drift.
 
 **Failure modes to refuse**:
-
 - Do NOT pause to ask the user "which branch should I take next?" — your job is to decide.
+- Do NOT run multiple steps in one invocation, even if it seems fast. The external `/loop` does that.
 - Do NOT make the tree wider just to look busy. If two candidates are minor variants of the same idea, collapse them.
-- Do NOT skip the audit step. The audit at junctions is the cheapest insurance against tree drift.
+- Do NOT skip the audit step at the right cadence. The audit at junctions is the cheapest insurance against tree drift.
 - Do NOT use `codex-reply` for audits — every audit is a fresh thread with file paths only.
+- Do NOT do branch experiment work in your main context. Always spawn an Agent.
 
 ## Output to user
 

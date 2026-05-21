@@ -128,6 +128,15 @@ def cmd_init(args) -> None:
         },
     }
     save_state(root, state)
+
+    state_dir = root / STATE_DIR_NAME
+    (state_dir / "branches").mkdir(parents=True, exist_ok=True)
+    (state_dir / "audits").mkdir(parents=True, exist_ok=True)
+    (state_dir / "reflections").mkdir(parents=True, exist_ok=True)
+    progress_log = state_dir / "progress.log"
+    if not progress_log.exists():
+        progress_log.write_text(f"{now_iso()}  step=0  action=init  node=root  alive=1  completed=0  dead=0\n")
+
     print(f"OK: tree initialized at {p}")
     print(f"root idea: {args.idea}")
 
@@ -147,10 +156,18 @@ def cmd_add(args) -> None:
 
     if parent_node["depth"] + 1 > constraints["max_depth"]:
         sys.exit(f"ERROR: would exceed max_depth ({constraints['max_depth']}).")
-    if len(parent_node["children"]) >= constraints["max_branches_per_junction"]:
+
+    # max_branches_per_junction caps ALIVE children only. Dead children free their slot
+    # so a junction audit can introduce a new candidate when one previous branch failed.
+    alive_children = [
+        c for c in parent_node["children"]
+        if state["nodes"][c]["status"] != "dead"
+    ]
+    if len(alive_children) >= constraints["max_branches_per_junction"]:
         sys.exit(
-            f"ERROR: parent {parent_id} already has {len(parent_node['children'])} "
-            f"children (max_branches_per_junction = {constraints['max_branches_per_junction']})."
+            f"ERROR: parent {parent_id} already has {len(alive_children)} alive "
+            f"children (max_branches_per_junction = {constraints['max_branches_per_junction']}). "
+            f"Prune one before adding another, or raise the budget."
         )
     if state["stats"]["nodes_total"] >= constraints["max_total_nodes"]:
         sys.exit(f"ERROR: would exceed max_total_nodes ({constraints['max_total_nodes']}).")

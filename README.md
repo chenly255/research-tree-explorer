@@ -1,103 +1,235 @@
 # research-tree-explorer
 
-Autonomous **tree-shaped research exploration** for Claude Code.
+**Autonomous tree-shaped research exploration for Claude Code.**
 
-Instead of running a research idea linearly (pick one approach, push it to the end), this skill **branches at every major decision point**: architecture, experiment design, narrative angle. Each branch runs in an isolated subagent so the main context stays clean. A cross-model reviewer (codex) audits junctions. Dead branches are kept on disk as a "dead-branch atlas" — they are not failures, they are the supplementary material of the final report.
+A Claude Code skill that turns "I have an idea, explore it" into a multi-day autonomous run: the agent branches at every major decision point (architecture, experiment design, narrative angle), tries each branch in an isolated subagent, has a cross-model reviewer audit each junction, prunes dead branches with recorded reasons, and synthesizes a final report covering the whole tree — including the failures.
 
-> **For who.** PIs and senior researchers who can describe the *goal* but want the *tree* explored without daily check-ins. You hit `/research-tree autopilot`, walk away, come back to a report covering every fork tried.
+You hit `/research-tree init "<your idea>"`, walk away, and come back to `FINAL_REPORT.md`.
 
-## Why this exists
+---
 
-[ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) and [Sakana AI-Scientist-v2](https://github.com/sakanaai/ai-scientist-v2) are both excellent. They solve different shapes of the problem:
+## What this is, in one diagram
 
-| Tool | Shape | Fit |
-|---|---|---|
-| ARIS | linear pipeline with adversarial review at each stage | great when you already know *which* idea to pursue |
-| AI-Scientist-v2 | agentic tree search at idea level | great but is a standalone Python framework, not Claude-Code-native |
-| **research-tree-explorer** | **deep tree exploration on top of Claude Code** | **complements ARIS — uses ARIS skills inside branches when available** |
+```
+                    "Build a model that learns groups of cells as the basic unit"
+                                              │
+                                              ▼
+                                    ┌─ /research-tree init ─┐
+                                    │                       │
+                                    ▼                       ▼
+                                root: idea statement
+                                    │
+                ┌───────────────────┼───────────────────┐
+                │                   │                   │
+                ▼                   ▼                   ▼
+        approach: set        approach: perceiver   approach: GNN
+        transformer          IO cross-attention    on cell graph
+                │                   │                   │
+                │  pilot              │ pilot               │ pilot
+                ▼                   ▼                   ▼
+         RESULT.md            RESULT.md            DEAD.md
+         score 0.71           score 0.78           "no signal,
+                              ◀── junction audit ──    too sparse"
+                              winner: perceiver
+                                    │
+                ┌───────────────────┼───────────────────┐
+                ▼                                       ▼
+        ablation: scale up                   ablation: add equivariance
+                │                                       │
+                ▼                                       ▼
+         RESULT.md                              RESULT.md
+         score 0.82 ★                           score 0.79
 
-This repo is the missing piece: a Claude Code skill that maintains an explicit tree state across sessions, spawns subagents per branch, and forces cross-model audit at every junction.
+                                              ▼
+                                    /research-tree synthesize
+                                              │
+                                              ▼
+                                    .research-tree/FINAL_REPORT.md
+                            (winner + dead-branch atlas + next move)
+```
 
-## Quick start
+The tree shape, the branch decisions, and the prune/deepen calls are made by the agent — not by you. You provide the root idea and read the final report.
+
+## Why this exists (and how it relates to other tools)
+
+[Sakana AI-Scientist-v2](https://github.com/SakanaAI/AI-Scientist-v2) (`agentic tree search`, peer-reviewed paper at ICLR workshop, then Nature) is the gold-standard implementation of this idea — but it's a standalone Python framework that calls model APIs directly, not Claude Code native.
+
+[ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) is Claude Code native and excellent, but it's a **linear pipeline** with adversarial review at each stage — no explicit branching or backtracking. Great when you already know which idea to pursue.
+
+`research-tree-explorer` is the missing piece for users who want:
+- the **deep tree exploration** of AI-Scientist
+- inside the **Claude Code skill ecosystem** so it composes with everything else (Tavily, codex MCP, your own skills)
+- with **explicit cross-session state** so a single run can span days
+
+It's complementary, not competitive. The roadmap includes letting a branch's `execute` step invoke ARIS's `/research-pipeline` as a heavyweight option when you want the full ARIS treatment on a winning leaf.
+
+## When to use it
+
+Good fit:
+- A research direction with a **quantifiable per-branch signal** — a metric, a pass/fail experiment, an artifact you can score. ML, computational biology, simulation, optimization.
+- A problem space where **multiple distinct approaches are plausible** and you want to triage cheaply before committing GPU/time to one.
+- A multi-day timeline where you'd otherwise check in every couple of hours.
+
+Bad fit:
+- Pure literature surveys with no experiments → use a survey-writing tool.
+- Single-approach implementation work where there are no real forks → use plain Claude Code or [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep).
+- Anything that needs sub-second iteration → the orchestration overhead per step is meaningful.
+
+## Install
+
+Requires:
+- Claude Code (CLI or IDE extension), authenticated
+- Python 3.8+ on the path
+- Optional but recommended: `mcp__codex__codex` MCP server configured (for cross-model junction audits)
+- Optional: `mcp__tavily__tavily_search` MCP server (for literature scans during expansion)
 
 ```bash
-# 1. Clone
-git clone https://github.com/<you>/research-tree-explorer.git ~/research-tree-explorer
-cd ~/research-tree-explorer
-
-# 2. Install (creates a symlink at ~/.claude/skills/research-tree)
+git clone https://github.com/chenly255/research-tree-explorer.git
+cd research-tree-explorer
 bash scripts/install.sh
+```
 
-# 3. Open Claude Code in any project, then:
-/research-tree init "your research direction here"
+The installer:
+1. Symlinks `skills/research-tree/` into `~/.claude/skills/research-tree`
+2. Adds `export RESEARCH_TREE_REPO=...` to your shell rc so helpers are findable
+
+Open a new Claude Code session — `/research-tree` should appear in the skill list.
+
+## How to use it
+
+### The minimum viable run
+
+```bash
+cd /path/to/your/project
+```
+
+In Claude Code:
+
+```
+/research-tree init "Your research direction in one or two sentences. Be concrete enough that an outside reader could explain what 'success' would look like."
 /research-tree autopilot
 ```
 
-That's it. Walk away. Come back to `.research-tree/FINAL_REPORT.md`.
+`autopilot` does **one step** — it picks the next leaf, dispatches the appropriate subagent, writes to disk, returns a one-paragraph summary. To run continuously:
 
-## Subcommands
+```
+/loop 30m /research-tree autopilot
+```
 
-| Command | What it does |
-|---|---|
-| `init "<idea>"` | Create a fresh tree with one root node holding your idea |
-| `autopilot` | Main loop: pick → expand-or-execute → audit → repeat, until convergence or budget |
-| `expand <id>` | Generate 2-4 candidate child branches for one node |
-| `execute <id>` | Run one branch end-to-end in an isolated subagent |
-| `audit <id>` | Codex audits a junction's children (fresh thread, file paths only) |
-| `prune <id> "<reason>"` | Manually mark a branch dead |
-| `status` | ASCII tree + stats |
-| `synthesize` | Write `FINAL_REPORT.md` from current state |
-| `resume` | Alias for autopilot — picks up from saved state after context compaction |
+This invokes one autopilot step every 30 minutes for as long as the loop runs. State persists across loop iterations and across session restarts — `.research-tree/tree.json` is the durable truth.
 
-## State on disk
+### Optional but recommended: write a RESEARCH_BRIEF.md first
 
-Everything lives at `<project_root>/.research-tree/`:
+If `<project>/RESEARCH_BRIEF.md` exists when you run `init`, every subagent gets it as shared context. Worth investing 10 minutes here to get sharper branches.
+
+```markdown
+# Research Brief
+
+## Goal
+<one paragraph: what you want to build, what venue / outcome you're aiming for>
+
+## Constraints
+- Compute: <e.g., 4 × A800 here, H100 cluster reachable via rsync>
+- Data: <pointers to where it lives, what's preprocessed>
+- Time: <e.g., 1 month for a Nature Methods submission>
+- Avoid: <approaches you've ruled out and why — saves the tree from re-discovering>
+
+## Known priors
+1. <observation that should bias initial branching>
+2. <constraint that subsequent ablations should respect>
+
+## Evaluation
+- <downstream task 1> — baseline number from <citation>
+- <downstream task 2> — baseline number from <citation>
+```
+
+### Checking on progress
+
+```
+/research-tree status
+```
+
+Prints an ASCII tree plus stats. Or, for a richer view:
+
+```
+cat .research-tree/FINAL_REPORT.md     # most recent synthesis
+tail -20 .research-tree/progress.log   # last 20 orchestration steps
+```
+
+Or open `.research-tree/tree.json` in any JSON viewer.
+
+### Manual control
+
+You're not locked out — you can steer the tree at any time:
+
+```
+/research-tree prune <node_id> "this branch is going nowhere because <reason>"
+/research-tree expand <node_id>            # force a re-expansion at a node
+/research-tree execute <node_id>           # force a re-run of one branch
+/research-tree audit <junction_id>         # force an audit
+/research-tree synthesize                  # regenerate the final report
+```
+
+If you change your mind about a dead branch, `python3 scripts/tree_state.py set <id> status=pending` puts it back in queue.
+
+## What it produces
+
+After a run, `<project>/.research-tree/` contains:
 
 ```
 .research-tree/
-├── tree.json                # the single source of truth
-├── progress.log             # one line per autopilot loop, survives compaction
-├── branches/                # one subdir per node; isolated subagent workspace
-│   ├── 1/{RESULT.md,artifacts/}
-│   ├── 2/{DEAD.md,...}
-│   └── 3/RESULT.md
-├── audits/                  # codex audit traces (fresh-thread JSON)
-│   └── audit-001.json
-└── FINAL_REPORT.md          # generated by `synthesize`
+├── tree.json                    # single source of truth — the whole tree
+├── progress.log                 # one line per orchestration step
+├── FINAL_REPORT.md              # human-readable synthesis (regenerated each `synthesize`)
+├── branches/
+│   ├── 1/
+│   │   ├── RESULT.md            # parseable: ends with METRIC=<float>
+│   │   ├── fit_script.py        # whatever the branch's subagent wrote
+│   │   └── <artifacts>
+│   ├── 2/
+│   │   └── DEAD.md              # reason this branch was abandoned
+│   └── ...
+├── audits/
+│   └── audit-001.json           # codex verdict on junction "root"
+└── reflections/
+    └── 005.md                   # self-audit at step 5
 ```
 
-The tree JSON is your durable state — delete the `.research-tree/` directory to start fresh. Lose your laptop, push tree.json to a remote, resume on another machine.
+Every branch — alive, completed, dead — keeps its artifacts. The dead branches are the supplementary atlas of any eventual paper.
 
-## Default budgets (overridable on init)
+## Default budgets
 
-- `max_depth = 5` (root + 5 levels of subbranches)
-- `max_branches_per_junction = 4`
-- `max_total_nodes = 30`
-- `max_gpu_hours_total = 48`
+Set at `init` time, capped to prevent runaway runs:
 
-## Anti-laziness rituals
+| Budget | Default | Override |
+|---|---|---|
+| `max_depth` | 5 | `--max-depth N` |
+| `max_branches_per_junction` (alive only — dead branches free their slot) | 4 | `--max-branches N` |
+| `max_total_nodes` | 30 | `--max-total-nodes N` |
+| `max_gpu_hours_total` | 48.0 | `--max-gpu-hours N` |
 
-The skill is explicitly designed to refuse the easy way out:
+These are advisory — the state machine refuses to add nodes that would exceed them, but the actual GPU usage is tracked by your branches reporting their costs in `RESULT.md`.
 
-- Never pauses to ask "which fork should I take?" — the skill picks itself
-- Every 5 loops: self-audit "am I picking branches because easy or because informative?"
-- Every 10 loops: global reflection "has the root idea drifted?"
-- Every junction with mixed completed/dead children: forced codex audit, fresh thread, file paths only
-- Dead branches are deliverables, not failures — they go in the final report's atlas
+## Architecture in 100 words
 
-## Limitations
+Three layers: a markdown skill (`SKILL.md`) that drives the main agent's behavior, a set of Python CLIs (`tree_state.py`, `synthesize_report.py`) that enforce state invariants, and an on-disk state directory (`.research-tree/`) that is the single source of truth. Heavy work happens in subagents — branch execution, candidate proposal, junction audit — so the main orchestrator's context never grows with tree size. `autopilot` is single-step by design: each invocation reads state from disk, dispatches one action, writes back, returns. Continuous operation is achieved by wrapping with `/loop`. Full details in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-- **Best on goals with a quantifiable signal per branch** (a metric, an artifact, a yes/no). Pure-narrative work (e.g., writing a survey) doesn't tree well — use ARIS directly for that.
-- **GPU/compute autonomy is project-specific**. The skill assumes each branch's subagent can see and use the same compute your shell can. Multi-machine GPU dispatch is on the roadmap.
-- **Codex MCP must be configured** for audits. If not, autopilot will still run but skip the audit step with a warning.
+## Limitations and roadmap
 
-## Roadmap
-
-- [ ] Cross-machine GPU dispatch (your machine has 4×A800, your other machine has H100 — the tree shouldn't care)
-- [ ] Native integration with ARIS skills (use `/research-pipeline` as a heavyweight `execute` for high-stakes branches)
-- [ ] Web UI dashboard reading `tree.json` over SSH
-- [ ] `tree.json` schema versioning + migrations
+| Status | Item |
+|---|---|
+| ✓ working | tree expansion, branch execution via subagent, junction audit via codex, dead-branch tracking, multi-depth deepening, cross-session resume |
+| ⚠ caveat | best on goals with a quantifiable per-branch metric; pure-narrative work (writing a survey) doesn't tree well |
+| ⚠ caveat | codex MCP must be configured for audits; without it, autopilot still runs but skips audit steps with a warning |
+| 🚧 roadmap | cross-machine GPU dispatch (currently you manually rsync a winning branch to a beefier machine) |
+| 🚧 roadmap | native integration with ARIS as a heavyweight `execute` option |
+| 🚧 roadmap | web UI dashboard reading `tree.json` over SSH |
+| 🚧 roadmap | `tree.json` schema versioning + migrations |
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Acknowledgments
+
+This tool exists because [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) by `@wanshuiyin` set the bar for what a Claude-Code-native research harness looks like, and [Sakana AI](https://sakana.ai)'s AI-Scientist-v2 showed that agentic tree search is a viable shape for autonomous research. Both repos are in `refs/` (gitignored) as references during development.

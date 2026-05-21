@@ -53,5 +53,37 @@ grep -q "branch B" .research-tree/FINAL_REPORT.md
 echo "=== test: budget-check ==="
 python3 "$TS" budget-check | grep -q "OK"
 
+echo "=== test: dead children free their slot ==="
+TMP2=$(mktemp -d)
+cd "$TMP2"
+python3 "$TS" init "alive-only test" --max-branches 3 > /dev/null
+python3 "$TS" add root approach "A" > /dev/null
+python3 "$TS" add root approach "B" > /dev/null
+python3 "$TS" add root approach "C" > /dev/null
+# 4th must fail (3 alive)
+if python3 "$TS" add root approach "D" 2>/dev/null; then
+    echo "FAIL: 4th add succeeded when 3 alive (max=3)"
+    exit 1
+fi
+# Kill A, then 4th must succeed (2 alive + 1 dead = 1 slot free)
+python3 "$TS" set 1 status=dead death_reason="testing" > /dev/null
+NEW_ID=$(python3 "$TS" add root approach "D")
+test "$NEW_ID" = "4" || { echo "FAIL: expected id 4, got $NEW_ID"; exit 1; }
+echo "  dead-slot reuse works"
+cd "$TMP"
+rm -rf "$TMP2"
+
+echo "=== test: init creates progress.log + subdirs ==="
+TMP3=$(mktemp -d)
+cd "$TMP3"
+python3 "$TS" init "log test" > /dev/null
+test -f .research-tree/progress.log || { echo "FAIL: progress.log not created"; exit 1; }
+test -d .research-tree/audits || { echo "FAIL: audits/ not created"; exit 1; }
+test -d .research-tree/reflections || { echo "FAIL: reflections/ not created"; exit 1; }
+grep -q "action=init" .research-tree/progress.log || { echo "FAIL: progress.log missing init entry"; exit 1; }
+echo "  init scaffolding is complete"
+cd "$TMP"
+rm -rf "$TMP3"
+
 echo
 echo "PASS — all tree_state.py smoke tests green."
