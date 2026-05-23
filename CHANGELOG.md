@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.4] — 2026-05-23
+
+Cross-session-restart survival. Previous versions ran branch experiments in
+the foreground inside a Claude Code subagent — closing the IDE killed the
+training process and left tree.json with an orphan `status=running` node
+that nothing knew how to recover. v0.1.4 makes long-running work survive
+session restarts.
+
+### Added
+- `scripts/stale_running_handler.py` — programmatic scan of all
+  `status=running` nodes. For each node, reads `EXECUTOR.json`, checks
+  whether the PID is still alive via `os.kill(pid, 0)`, and classifies
+  into one of 5 buckets:
+  - `alive` — process still running, leave alone
+  - `ready_for_validation` — PID dead AND RESULT.md present, run validation chain
+  - `ready_for_death_from_file` — PID dead AND DEAD.md present, mark dead
+  - `abandoned` — PID dead AND no output files, mark dead with executor log pointer
+  - `legacy_orphan` — no EXECUTOR.json at all (pre-v0.1.4 code path), mark dead
+- `tests/test_stale_running_handler.sh` — 8 test cases covering all 5
+  classification buckets, invalid PID, malformed EXECUTOR.json, and
+  ignoring non-running nodes.
+- SKILL.md `autopilot` step 1.5: runs the stale handler at the start of
+  every cycle, dispatches each bucket programmatically (`die` for
+  abandoned/legacy/death-from-file, validation chain for
+  ready_for_validation, log for alive). This recovery work takes
+  priority over picking the next leaf.
+
+### Changed
+- **`execute` subagent must launch long work with `nohup`** (v0.1.4
+  mandate). The subagent prompt now requires: any task expected to
+  exceed 60 seconds (training, downloads, HP sweeps) MUST be detached
+  with `nohup bash train.sh > executor.log 2>&1 &`, and the PID/log path
+  written to `EXECUTOR.json` IMMEDIATELY. The subagent then returns to
+  the orchestrator without waiting. The training process survives the
+  Claude Code session; `stale_running_handler.py` picks it up on a
+  later autopilot cycle when the PID is dead and RESULT.md is present.
+- `execute` step 6 now has a new `6.0` background-detection gate: if
+  EXECUTOR.json exists, PID is alive, and no RESULT.md/DEAD.md yet, the
+  autopilot step ends immediately leaving the node in `running` state.
+  No premature validation, no premature death.
+- Pure-compute tasks under 60 seconds may still run foreground (no
+  EXECUTOR.json needed). The orchestrator distinguishes the two modes
+  by EXECUTOR.json presence.
+
 ## [0.1.3] — 2026-05-23
 
 Hardline anti-laziness enforcement, hardened against codex's own adversarial

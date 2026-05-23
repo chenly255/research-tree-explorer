@@ -23,9 +23,11 @@ RTE_REPO="${RESEARCH_TREE_REPO:-/data3/liying/research-tree-explorer}"
 TREE_STATE="$RTE_REPO/scripts/tree_state.py"
 SYNTHESIZE="$RTE_REPO/scripts/synthesize_report.py"
 VALIDATOR="$RTE_REPO/scripts/charter_validator.py"
+STALE_HANDLER="$RTE_REPO/scripts/stale_running_handler.py"
 [ -f "$TREE_STATE" ] || TREE_STATE="$SKILL_DIR/../../scripts/tree_state.py"
 [ -f "$SYNTHESIZE" ] || SYNTHESIZE="$SKILL_DIR/../../scripts/synthesize_report.py"
 [ -f "$VALIDATOR" ] || VALIDATOR="$SKILL_DIR/../../scripts/charter_validator.py"
+[ -f "$STALE_HANDLER" ] || STALE_HANDLER="$SKILL_DIR/../../scripts/stale_running_handler.py"
 ```
 
 If neither path exists, abort with a clear error pointing to https://github.com/lily/research-tree-explorer.
@@ -126,8 +128,32 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
    - States the branch's hypothesis (one paragraph)
    - States the budget (e.g., "2 hours wall time, 1 GPU max")
    - Says "work entirely inside `.research-tree/branches/<node_id>/`"
+   - **CRITICAL — background execution mandate** (v0.1.4): "Do NOT block on long-running work. Any task that takes longer than 60 seconds (training, downloads, hyperparameter sweeps) MUST be launched with `nohup` so it survives session termination. Concretely:
+     1. Prepare the training/evaluation script (e.g., `train.sh` invoking your Python entry point) inside `.research-tree/branches/<node_id>/`.
+     2. Launch it as a detached background process:
+        ```bash
+        cd .research-tree/branches/<node_id>/
+        nohup bash train.sh > executor.log 2>&1 &
+        BGPID=$!
+        ```
+     3. Write `.research-tree/branches/<node_id>/EXECUTOR.json` IMMEDIATELY:
+        ```json
+        {
+          \"pid\": <BGPID>,
+          \"started_at\": \"<iso8601>\",
+          \"command\": \"bash train.sh\",
+          \"log_file\": \".research-tree/branches/<node_id>/executor.log\",
+          \"expected_outputs\": [\"RESULT.md\", \"DEAD.md\"],
+          \"timeout_hours\": <reasonable_budget>
+        }
+        ```
+     4. **Return to the orchestrator NOW.** Do not wait for the background process. Your only job at this point is to confirm the launch succeeded (PID exists, log file is being written to). The orchestrator will poll for completion in later autopilot steps via `stale_running_handler.py`.
+
+     **Why background**: the user keeps Claude Code sessions open for hours, then closes the IDE. A foreground subagent dies with the session; a nohup-detached process survives, so the training continues across session restarts. When the session reopens, `stale_running_handler.py` detects the completed process via PID check + RESULT.md presence and routes it through the validation chain.
+
+     **Pure-compute exceptions**: if your task takes < 60 seconds total (small unit test, file inspection, small classifier on toy data) you may run it foreground. In that case, do NOT write EXECUTOR.json — just produce RESULT.md or DEAD.md directly. The orchestrator distinguishes the two modes by EXECUTOR.json presence."
    - **Pastes RESEARCH_CHARTER.md in full and says: "Obey the charter. The final RESULT.md MUST end with the charter compliance audit table from §Charter compliance audit format. Any FAIL on a (strict) rule means you write DEAD.md instead of RESULT.md, with death_reason='charter_violation: <which rule>'. Honest failure beats fake success."**
-   - Says "write a `RESULT.md` at the end with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, DONE_READY=<true|false>, then the charter compliance audit table"
+   - Says "the BACKGROUND PROCESS (not the subagent itself) writes `RESULT.md` at completion, with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, DONE_READY=<true|false>, then the charter compliance audit table"
    - **Says: "You also MUST produce these PHYSICAL artifacts inside the branch_dir, because a programmatic validator will check for them after you return — text claims alone are not enough:**
      - `data/test_split.json` — JSON with keys `test_ids`, `hash`, `created_at`
      - `checkpoints/seed_0/`, `seed_1/`, `seed_2/` — each containing at least one `.pt`/`.pth`/`.safetensors`/`.ckpt` file
@@ -139,10 +165,24 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
    - Says "if you hit a blocker that makes the hypothesis untestable, write a `DEAD.md` with the blocker description instead — that is a valid outcome"
    - **Anti-laziness reminder**: "Do NOT take shortcuts because the deadline is tight or the data is awkward. If the charter mandates full-data training and you can only finish in budget with a subset, write DEAD.md with reason 'needs full-scale compute, cannot honestly complete in pilot budget'. The user values honest failure over fake success. The dead-branch atlas is part of the deliverable."
 
-6. When the subagent returns, **do the hardline validation chain — do not skip steps**. Every status transition uses the dedicated `complete` / `die` commands; `set` cannot change status anymore (the state machine refuses it):
+6. When the subagent returns, **first decide whether the work is actually finished**, then run the validation chain only if so:
+   - **6.0. Background detection** (v0.1.4): check whether the subagent launched a long-running background process:
+     ```bash
+     EXEC_JSON=".research-tree/branches/<node_id>/EXECUTOR.json"
+     if [ -f "$EXEC_JSON" ] && [ ! -f ".research-tree/branches/<node_id>/RESULT.md" ] && [ ! -f ".research-tree/branches/<node_id>/DEAD.md" ]; then
+       PID=$(python3 -c "import json; print(json.load(open('$EXEC_JSON'))['pid'])")
+       if kill -0 "$PID" 2>/dev/null; then
+         echo "  → background process pid=$PID still running, leaving node in 'running' state. autopilot will poll next cycle."
+         exit 0  # end this autopilot step, leave status=running
+       fi
+     fi
+     ```
+     If the EXECUTOR.json says a process is alive and neither RESULT.md nor DEAD.md exists yet, **end the autopilot step here** with the node still in `running` state. A later autopilot cycle (driven by `/loop`) will detect completion via `stale_running_handler.py` and resume from step 6a.
+   - Otherwise (no EXECUTOR.json, or process is dead, or output files already exist), proceed with the validation chain. Every status transition uses the dedicated `complete` / `die` commands; `set` cannot change status anymore (the state machine refuses it):
    - **6a. Quick triage**:
      - If `DEAD.md` exists: `python3 "$TREE_STATE" die <node_id> --reason "<first line of DEAD.md>" --evidence ".research-tree/branches/<node_id>/DEAD.md"`. Done — skip to step 7.
-     - If `RESULT.md` is missing: `python3 "$TREE_STATE" die <node_id> --reason "execution returned no RESULT.md and no DEAD.md"`. Done — skip to step 7.
+     - If `RESULT.md` is missing AND EXECUTOR.json exists AND process is dead: `python3 "$TREE_STATE" die <node_id> --reason "executor process exited without writing RESULT.md or DEAD.md — see EXECUTOR.json log_file"`. Done — skip to step 7.
+     - If `RESULT.md` is missing (no executor either): `python3 "$TREE_STATE" die <node_id> --reason "execution returned no RESULT.md and no DEAD.md"`. Done — skip to step 7.
    - **6b. Programmatic charter validation pass 1** (always runs, never skipped):
      ```bash
      python3 "$VALIDATOR" ".research-tree/branches/<node_id>" > .research-tree/branches/<node_id>/VALIDATION.json 2> .research-tree/branches/<node_id>/VALIDATION.stderr
@@ -277,6 +317,28 @@ A single autopilot step does this:
 
 ```
 1. Read progress: tail -1 .research-tree/progress.log (so you know what last step did)
+
+1.5. **Stale-running sweep** (v0.1.4 — handles cross-session-restart recovery):
+     python3 "$STALE_HANDLER" --project-root "$(pwd)" > /tmp/rte_stale_$$.json
+     Read the JSON output and dispatch programmatically (NOT via Claude):
+
+     for each node in `abandoned`:
+         python3 "$TREE_STATE" die <node_id> --reason "<reason from handler>"
+     for each node in `legacy_orphan`:
+         python3 "$TREE_STATE" die <node_id> --reason "<reason from handler>"
+     for each node in `ready_for_death_from_file`:
+         python3 "$TREE_STATE" die <node_id> --reason "<reason from handler>" --evidence "<branch_dir>/DEAD.md"
+     for each node in `ready_for_validation`:
+         # Background process finished and left a RESULT.md. Run the
+         # validation chain (execute step 6b-6d) on this branch and stop
+         # this autopilot step. Don't pick a new leaf until the catch-up
+         # is done — finishing in-flight work is higher priority than
+         # starting new work.
+         dispatch validation chain for <node_id>; STOP this autopilot step here.
+     for each node in `alive`:
+         # process still running, leave alone; pick-next won't pick it.
+         log "node <id> still running pid=<pid> since <started_at>"
+
 2. Check for previously-detected terminal states:
      if .research-tree/ROOT_FAILURE.md exists:
        Tell the user (always, even in silent): every approach under root is dead.

@@ -8,6 +8,8 @@ You hit `/research-tree init "<your idea>"`, walk away, and come back to `FINAL_
 
 **v0.1.3 — hardline anti-laziness**: the project's research charter is enforced by a programmatic validator (checks filesystem: test-split hash, ≥3 seed checkpoints, ablation dirs, metrics.json fields) and a fresh-thread external codex auditor — *not* just by prompt. Branches that fabricate RESULT.md text without backing files get marked dead automatically. When all gates pass, autopilot writes `DONE.md` and STOPS for human review (no auto-paper-writing).
 
+**v0.1.4 — survives session restart**: long-running training is launched with `nohup` and registered in `EXECUTOR.json` (PID + log path). Closing the IDE no longer kills the work. When you reopen and run `/research-tree resume`, the new `stale_running_handler.py` scans every `status=running` node, checks PID liveness, and routes finished work through the validation chain — so cross-session recovery is automatic.
+
 ---
 
 ## What this is, in one diagram
