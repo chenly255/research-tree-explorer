@@ -58,9 +58,16 @@ python3 "$TREE_STATE" init "$ROOT_IDEA" \
     --max-gpu-hours 48
 ```
 
-If `RESEARCH_BRIEF.md` exists in the project root, mention it — the autopilot will consume it on expand.
+**Charter and brief setup**:
+1. If `<project>/RESEARCH_BRIEF.md` exists, the brief will be consumed by every subagent. If missing, alert the user (the run will be less informed but won't fail).
+2. If `<project>/RESEARCH_CHARTER.md` exists, the **anti-laziness charter** governs the whole run — every branch's RESULT.md must include a charter compliance section. **If missing, copy the template**:
+   ```bash
+   cp "$RTE_REPO/templates/RESEARCH_CHARTER.md" RESEARCH_CHARTER.md
+   echo "WARN: copied default charter. EDIT IT before running autopilot." >&2
+   ```
+   Then tell the user: "I copied the default research charter to RESEARCH_CHARTER.md. **Read it and edit the venue/data/architecture/done-criteria fields to match your project before running autopilot.** Subagents will obey whatever's in there — bad charter = bad behavior."
 
-After init, print one paragraph to the user: "Tree initialized with root idea '<X>'. Budgets: max depth 5, max 30 nodes total, max 48 GPU-hours. Run `/research-tree autopilot` to start exploring."
+After init, print one paragraph to the user: "Tree initialized. Budgets: max depth 5, max 30 nodes total, max 48 GPU-hours. Charter at RESEARCH_CHARTER.md — edit it now if defaults don't fit. Run `/research-tree autopilot` to start exploring."
 
 ### expand
 
@@ -81,8 +88,9 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
    - paste the parent node JSON (small)
    - paste the sibling list (small)
    - paste RESEARCH_BRIEF.md if it exists
+   - **paste RESEARCH_CHARTER.md (mandatory if file exists) — proposer must propose candidates that COULD satisfy the charter; e.g., if charter §2 demands diversity at depth 0 across 4 architecture families, the proposer must include all 4 even if it thinks 3 would suffice**
    - state the kind of branching expected (from step 2)
-   - tell it: "Propose 2-4 candidate sub-branches. Each must be mutually distinct from the others and from existing siblings (no two flavors of the same idea). Aim for diversity in expected outcome: one safe, one ambitious, one weird. You may use Tavily to scan recent literature if it helps you tell mutually distinct from redundant — but cap the search at 2 queries."
+   - tell it: "Propose 2-4 candidate sub-branches. Each must be mutually distinct from the others and from existing siblings (no two flavors of the same idea). Aim for diversity in expected outcome: one safe, one ambitious, one weird. You may use Tavily to scan recent literature if it helps you tell mutually distinct from redundant — but cap the search at 2 queries. **If the charter mandates specific candidate families at this depth, include ALL of them — do not skip a mandated family to save tokens.**"
    - tell it: "Return ONLY a JSON array. No prose. Schema:
      ```json
      [{"kind": "approach|architecture|experiment|ablation|narrative|custom", "title": "<≤80 chars>", "description": "<2-4 sentences explaining the rationale and what 'success' would look like for this branch>"}]
@@ -111,10 +119,15 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
    - States the branch's hypothesis (one paragraph)
    - States the budget (e.g., "2 hours wall time, 1 GPU max")
    - Says "work entirely inside `.research-tree/branches/<node_id>/`"
-   - Says "write a `RESULT.md` at the end with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>"
+   - **Pastes RESEARCH_CHARTER.md in full and says: "Obey the charter. The final RESULT.md MUST end with the charter compliance audit table from §Charter compliance audit format. Any FAIL on a (strict) rule means you write DEAD.md instead of RESULT.md, with death_reason='charter_violation: <which rule>'. Honest failure beats fake success."**
+   - Says "write a `RESULT.md` at the end with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, then the charter compliance audit table"
    - Says "if you hit a blocker that makes the hypothesis untestable, write a `DEAD.md` with the blocker description instead — that is a valid outcome"
+   - **Anti-laziness reminder**: "Do NOT take shortcuts because the deadline is tight or the data is awkward. If the charter mandates full-data training and you can only finish in budget with a subset, write DEAD.md with reason 'needs full-scale compute, cannot honestly complete in pilot budget'. The user values honest failure over fake success. The dead-branch atlas is part of the deliverable."
 6. When the subagent returns:
-   - If `RESULT.md` exists: parse it, then `python3 "$TREE_STATE" set <node_id> status=completed score=<METRIC>`.
+   - If `RESULT.md` exists: **parse it and the charter compliance table**.
+     - If any strict rule is FAIL: override to dead: `set status=dead death_reason="charter_violation: <rule>"`.
+     - Otherwise: `set status=completed score=<METRIC>`.
+     - **Additionally, parse `DONE_READY: true|false` from RESULT.md.** If `DONE_READY: true`, also `set <id> done_ready=true`. This signals to synthesize that the project is done and ARIS should be invoked. The subagent should only set `DONE_READY: true` if it self-attests: (a) all charter strict rules PASS, (b) the metric meets venue threshold from `RESEARCH_CHARTER.md → done_criteria`, (c) all required ablations done, (d) winner survives a /kill-argument style self-rejection memo.
    - If `DEAD.md` exists: `python3 "$TREE_STATE" set <node_id> status=dead death_reason="<from DEAD.md>" death_evidence=".research-tree/branches/<node_id>/DEAD.md"`.
    - If neither: `python3 "$TREE_STATE" set <node_id> status=dead death_reason="execution returned no verdict" death_evidence=<agent log path>`.
 7. After the subagent returns, do NOT continue working on that branch in your own context — your job is tree-level orchestration only.
@@ -166,20 +179,31 @@ Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights t
 
 **`autopilot` is a single-step command, not a long-running loop.** Each invocation does ONE unit of work and returns. To run continuously, the user wraps it with the external `/loop` skill, e.g. `/loop 30m /research-tree autopilot`. This keeps your main context fresh — each step is one orchestration turn, heavy work is in subagents, no in-prompt for-loops that bloat over time.
 
+**Modes**:
+- default: chatty — every step returns a one-paragraph summary to the user
+- `autopilot --silent`: silent — no per-step summary; only surfaces to the user on
+  three events: (a) DONE (charter done_criteria satisfied + auto-handoff to ARIS),
+  (b) ROOT_FAILURE (all root branches dead, pivot to /idea-pipeline),
+  (c) STUCK (no new completed node in 20 steps OR budget exhausted). For long runs
+  (`/loop 30m autopilot --silent`) the user only sees these key milestones.
+
 A single autopilot step does this:
 
 ```
 1. Read progress: tail -1 .research-tree/progress.log (so you know what last step did)
-2. Check for previously-detected root failure:
+2. Check for previously-detected terminal states:
      if .research-tree/ROOT_FAILURE.md exists:
-       Tell the user: every approach under root is dead. Show ROOT_FAILURE.md's
-       content. Recommend: archive the tree (mv .research-tree .research-tree.failed-DATE)
-       and re-run /idea-pipeline with the dead-branch reasons as input. STOP — do not
-       auto-loop further. The /loop wrapper should also stop when this file is present.
+       Tell the user (always, even in silent): every approach under root is dead.
+       Show ROOT_FAILURE.md. Recommend pivot. STOP.
+     if .research-tree/DONE.md exists:
+       Tell the user (always, even in silent): done_criteria satisfied.
+       Show DONE.md. AUTO-INVOKE /paper-writing with winner branch dir + atlas
+       (see step 12 below). STOP.
 
 3. Check budget:
      python3 "$TREE_STATE" budget-check
-   If exit non-zero → run synthesize, report "budget exhausted", stop.
+   If exit non-zero → run synthesize, report "budget exhausted, escalating to user",
+   stop. Even in silent mode, surface this.
 
 4. Pick the next leaf:
      next_id=$(python3 "$TREE_STATE" pick-next)
@@ -223,8 +247,28 @@ A single autopilot step does this:
 10. Append progress.log:
      echo "$(date -Iseconds)  step=$loop_count  action=<expand|execute|audit|reflect>  node=$next_id  alive=$alive_count  completed=$completed_count  dead=$dead_count" >> .research-tree/progress.log
 
-11. Report ONE PARAGRAPH to the user: what you did this step, what the tree looks like now
-   (`python3 "$TREE_STATE" tree | head -20`), what `/research-tree autopilot` will do next time.
+11. **Reporting** (mode-dependent):
+   - **default mode**: report ONE PARAGRAPH to the user: what you did this step,
+     what the tree looks like now (`python3 "$TREE_STATE" tree | head -20`), what
+     `/research-tree autopilot` will do next time.
+   - **--silent mode**: do NOT report per-step. Just write to progress.log and stop.
+     Surface ONLY if: DONE.md was written this step, ROOT_FAILURE.md was written,
+     budget exhausted, OR no new completed node in 20 consecutive steps (STUCK).
+
+12. **Auto-handoff on DONE** (added v0.1.2):
+   If synthesize wrote .research-tree/DONE.md this step:
+     - Read DONE.md to confirm criteria are met
+     - Read the winner node: python3 "$TREE_STATE" get <winner_id>
+     - Invoke Skill(ARIS /paper-writing) with this prompt:
+       "Draft a paper for venue=<charter venue> using the winning method at
+        .research-tree/branches/<winner_id>/. The dead-branch atlas in
+        .research-tree/FINAL_REPORT.md is supplementary material. The
+        charter compliance audit in branches/<winner_id>/RESULT.md confirms
+        all strict rules PASS. Charter at <project>/RESEARCH_CHARTER.md."
+     - When /paper-writing returns, surface to the user: "Tree converged. Winner at
+       .research-tree/branches/<winner_id>/, draft paper at paper/main.pdf,
+       charter compliance all green. Next: review the draft, then
+       ARIS /auto-review-loop for adversarial review before submission."
    Then STOP. Do not loop in-prompt.
 ```
 

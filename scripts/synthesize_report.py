@@ -157,10 +157,56 @@ def main() -> None:
     root_children = [nodes[c] for c in root_node["children"]]
     all_root_dead = bool(root_children) and all(c["status"] == "dead" for c in root_children)
 
+    # DONE detection: any completed node has done_ready=true (set by the
+    # branch's subagent after self-attesting charter compliance + threshold met).
+    done_winner = next(
+        (n for n in completed if n.get("done_ready") is True),
+        None,
+    )
+    if done_winner is not None:
+        done_path = root / STATE_DIR_NAME / "DONE.md"
+        done_lines = [
+            "# Project DONE",
+            "",
+            f"Winner: **`{done_winner['id']}` — {done_winner['title']}**",
+            f"Score: {done_winner['score']:.4f} on primary metric",
+            f"Branch dir: `{done_winner.get('branch_dir', 'N/A')}/`",
+            "",
+            "## Why this is DONE",
+            "",
+            f"The branch's subagent self-attested `done_ready=true` after verifying "
+            f"charter compliance and threshold criteria. See "
+            f"`{done_winner.get('branch_dir', 'branches/<id>')}/RESULT.md` for the "
+            f"charter compliance audit table.",
+            "",
+            "## Next action",
+            "",
+            "autopilot will auto-invoke ARIS /paper-writing on the winner artifacts "
+            "and the dead-branch atlas in FINAL_REPORT.md.",
+        ]
+        done_path.write_text("\n".join(done_lines) + "\n")
+        print(f"OK: also wrote DONE.md to {done_path}")
+
     lines.append("## Suggested next move")
     lines.append("")
 
-    if all_root_dead:
+    if done_winner is not None:
+        lines.append(
+            f"**DONE — AUTO-HANDOFF TO ARIS.** Winner `{done_winner['id']}` "
+            f"({done_winner['title']}) self-attested charter compliance + threshold "
+            f"met. autopilot will invoke `/paper-writing` automatically on next step "
+            f"with the winner artifacts at `{done_winner.get('branch_dir', 'N/A')}/` "
+            f"plus the dead-branch atlas as supplementary material."
+        )
+        lines.append("")
+        lines.append("If you want to override (e.g., reopen exploration), run:")
+        lines.append("")
+        lines.append("```")
+        lines.append("rm .research-tree/DONE.md")
+        lines.append(f"python3 .../tree_state.py set {done_winner['id']} done_ready=false")
+        lines.append("```")
+        lines.append("")
+    elif all_root_dead:
         # Pivot path — write ROOT_FAILURE.md too so the autopilot loop can detect it.
         lines.append(
             "**PIVOT** — every approach under root is dead. The current idea is unlikely to "
