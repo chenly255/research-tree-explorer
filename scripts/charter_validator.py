@@ -51,6 +51,51 @@ STRICT_RULES = {
 }
 SOFT_RULES = {"6. Novelty rules"}
 
+# v0.1.6 — task-type-aware rule subsets.
+# Different kinds of work (training a new model vs auditing a frozen one vs
+# pulling external data) need different acceptance criteria. The charter
+# compliance table inside RESULT.md only needs the rules listed for THIS
+# task type; other rules may be omitted entirely.
+TASK_TYPE_STRICT_RULES: dict[str, set[str]] = {
+    # `training` — all original strict rules apply (v0.1.5 default, unchanged)
+    "training": STRICT_RULES,
+    # `audit` — model not retrained, no checkpoints / param-count / ablations
+    # exist physically; the 4 surviving strict rules are data integrity (which
+    # cohort / control), evaluation (statistical tests on FN delta etc),
+    # reproducibility (download / preprocessing scripts), compute honesty.
+    "audit": {
+        "0. Anti-laziness preamble",
+        "1. Data rules",
+        "4. Evaluation rules",
+        "7. Reproducibility rules",
+        "8. Compute honesty",
+    },
+    # `analysis` — statistics / figure generation / report. No training, no
+    # held-out test, but anti-laziness still applies (figure must be backed
+    # by data) and reproducibility / compute honesty stay.
+    "analysis": {
+        "0. Anti-laziness preamble",
+        "4. Evaluation rules",
+        "7. Reproducibility rules",
+        "8. Compute honesty",
+    },
+    # `data-acquisition` — download and verify external dataset; physical
+    # artifact is the data manifest with checksums. No evaluation possible
+    # at this stage.
+    "data-acquisition": {
+        "0. Anti-laziness preamble",
+        "1. Data rules",
+        "7. Reproducibility rules",
+    },
+    # `framing-decision` — human-only; autopilot should never execute it.
+    # Validator immediately rejects to prevent silent bypass.
+    "framing-decision": set(),
+    # `mixed` — falls back to full training rule set (conservative).
+    "mixed": STRICT_RULES,
+}
+
+VALID_TASK_TYPES_VALIDATOR = set(TASK_TYPE_STRICT_RULES.keys())
+
 # Minimum physical thresholds — these are hard-coded floors. The charter
 # document may set stricter thresholds; this validator enforces the floor.
 MIN_SEEDS = 3
@@ -136,12 +181,25 @@ def find_rule_verdict(table: dict[str, str], rule_prefix: str) -> str | None:
     return None
 
 
-def check_result_md(branch_dir: Path, failures: list, warnings: list, evidence: dict) -> dict[str, str]:
+def check_result_md(
+    branch_dir: Path,
+    failures: list,
+    warnings: list,
+    evidence: dict,
+    task_type: str = "training",
+) -> dict[str, str]:
+    """Check RESULT.md presence + parse the charter compliance table.
+
+    v0.1.6: only enforces the strict rules listed for ``task_type``. The
+    older signature ``check_result_md(branch_dir, failures, warnings, evidence)``
+    still works because the parameter is keyword-only with a default.
+    """
     result_path = branch_dir / "RESULT.md"
     if not check_file_exists(result_path, "RESULT.md", failures):
         return {}
     content = result_path.read_text()
     evidence["result_md_size"] = len(content)
+    evidence["task_type"] = task_type
 
     # Must contain the METRIC line
     metric_match = re.search(r"^\s*METRIC\s*[=:]\s*([\d.eE+-]+)", content, re.MULTILINE)
@@ -156,8 +214,9 @@ def check_result_md(branch_dir: Path, failures: list, warnings: list, evidence: 
         failures.append("RESULT.md: '## Charter compliance' table missing or unparseable")
         return {}
 
-    # Enforce that all strict rules appear AND are PASS
-    for rule in STRICT_RULES:
+    # v0.1.6 — only enforce the strict rules that apply to THIS task_type
+    strict_for_task = TASK_TYPE_STRICT_RULES.get(task_type, STRICT_RULES)
+    for rule in strict_for_task:
         v = find_rule_verdict(table, rule)
         if v is None:
             failures.append(f"charter table: rule '{rule}' not present in audit table")
@@ -425,8 +484,17 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
                 )
 
 
-def check_done_ready(branch_dir: Path, table: dict[str, str], failures: list, evidence: dict) -> None:
-    """When done_ready=true, every strict rule MUST PASS (not just most)."""
+def check_done_ready(
+    branch_dir: Path,
+    table: dict[str, str],
+    failures: list,
+    evidence: dict,
+    task_type: str = "training",
+) -> None:
+    """When done_ready=true, every strict rule MUST PASS (not just most).
+
+    v0.1.6: only enforces the strict rules listed for ``task_type``.
+    """
     result_path = branch_dir / "RESULT.md"
     if not result_path.exists():
         return
@@ -436,8 +504,8 @@ def check_done_ready(branch_dir: Path, table: dict[str, str], failures: list, ev
         return  # not claiming done_ready, nothing extra to check
 
     evidence["done_ready_claimed"] = True
-    # When done_ready, all 8 strict rules MUST be PASS (no WARN tolerated)
-    for rule in STRICT_RULES:
+    strict_for_task = TASK_TYPE_STRICT_RULES.get(task_type, STRICT_RULES)
+    for rule in strict_for_task:
         v = find_rule_verdict(table, rule)
         if v != "PASS":
             failures.append(
@@ -451,6 +519,165 @@ def check_done_ready(branch_dir: Path, table: dict[str, str], failures: list, ev
         )
 
 
+# =============================================================================
+# v0.1.6 — task-type-specific physical artifact checks
+# =============================================================================
+
+def check_audit_artifacts(branch_dir: Path, failures: list, evidence: dict) -> None:
+    """Audit-mode physical checks: an audit branch must produce its verdict
+    JSON (cohort + control + FN delta + 95% CI), donor-level bootstrap, and
+    a protocol comparison (within-atlas vs cross-batch). No checkpoints.
+    """
+    audit_report = branch_dir / "audit_report.json"
+    if not check_file_exists(audit_report, "audit_report.json", failures):
+        return
+    try:
+        report = json.loads(audit_report.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"audit_report.json: invalid JSON ({e})")
+        return
+    evidence["audit_report_keys"] = sorted(report.keys())
+    # Required schema: must declare cohort & control sizes + at least one
+    # signal metric (FN delta / FP delta / consensus score) + a 95% CI
+    required = {
+        "cohort_summary": dict,
+        "blindspot_signal": dict,
+    }
+    for key, typ in required.items():
+        if key not in report:
+            failures.append(f"audit_report.json: missing required key '{key}'")
+        elif not isinstance(report[key], typ):
+            failures.append(
+                f"audit_report.json: '{key}' must be {typ.__name__}, got {type(report[key]).__name__}"
+            )
+    # bootstrap with donor-level CI (charter §4 statistical rigor)
+    boot_path = branch_dir / "donor_bootstrap.json"
+    if not check_file_exists(boot_path, "donor_bootstrap.json", failures):
+        return
+    try:
+        boot = json.loads(boot_path.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"donor_bootstrap.json: invalid JSON ({e})")
+        return
+    evidence["donor_bootstrap_keys"] = sorted(boot.keys())
+    if "n_iter" not in boot:
+        failures.append("donor_bootstrap.json: missing 'n_iter'")
+    elif not isinstance(boot["n_iter"], int) or boot["n_iter"] < 1000:
+        failures.append(
+            f"donor_bootstrap.json: n_iter={boot.get('n_iter')} < 1000 (charter §4 statistical rigor)"
+        )
+    # protocol_comparison.json — within-atlas vs cross-batch is the
+    # methodological core of an audit branch
+    protocol = branch_dir / "protocol_comparison.json"
+    if not check_file_exists(protocol, "protocol_comparison.json", failures):
+        return
+    try:
+        proto = json.loads(protocol.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"protocol_comparison.json: invalid JSON ({e})")
+        return
+    evidence["protocol_comparison_keys"] = sorted(proto.keys())
+    for key in ("within_atlas_fn_delta", "cross_batch_fn_delta", "over_estimation_ratio"):
+        if key not in proto:
+            failures.append(f"protocol_comparison.json: missing required key '{key}'")
+
+
+def check_analysis_artifacts(branch_dir: Path, failures: list, evidence: dict) -> None:
+    """Analysis-mode physical checks: any structured output JSON plus at
+    least one figure file (PNG / PDF / SVG)."""
+    analysis = branch_dir / "analysis_output.json"
+    if not check_file_exists(analysis, "analysis_output.json", failures):
+        return
+    try:
+        out = json.loads(analysis.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"analysis_output.json: invalid JSON ({e})")
+        return
+    evidence["analysis_keys"] = sorted(out.keys())
+    figures_dir = branch_dir / "figures"
+    if figures_dir.exists():
+        fig_files = (
+            list(figures_dir.glob("*.png"))
+            + list(figures_dir.glob("*.pdf"))
+            + list(figures_dir.glob("*.svg"))
+        )
+        evidence["figure_count"] = len(fig_files)
+        if not fig_files:
+            failures.append("figures/: no figure file (*.png|*.pdf|*.svg)")
+    else:
+        # not strictly required — analysis can be statistics-only
+        evidence["figure_count"] = 0
+
+
+def check_data_acquisition_artifacts(branch_dir: Path, failures: list, evidence: dict) -> None:
+    """Data-acquisition mode: a manifest with checksum-verified files."""
+    manifest = branch_dir / "DATA_MANIFEST.json"
+    if not check_file_exists(manifest, "DATA_MANIFEST.json", failures):
+        return
+    try:
+        m = json.loads(manifest.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"DATA_MANIFEST.json: invalid JSON ({e})")
+        return
+    evidence["manifest_keys"] = sorted(m.keys())
+    required = ("atlas_id", "source_url", "local_path", "checksum", "n_cells", "downloaded_at")
+    for key in required:
+        if key not in m:
+            failures.append(f"DATA_MANIFEST.json: missing required key '{key}'")
+    # Verify the downloaded file actually exists on disk
+    local_rel = m.get("local_path")
+    if local_rel:
+        local_path = branch_dir / local_rel if not Path(local_rel).is_absolute() else Path(local_rel)
+        if not local_path.exists():
+            failures.append(
+                f"DATA_MANIFEST.json: 'local_path' = {local_rel} but file does not exist on disk"
+            )
+        else:
+            evidence["local_file_bytes"] = local_path.stat().st_size
+
+
+def check_framing_decision(branch_dir: Path, failures: list, evidence: dict) -> None:
+    """Framing-decision branches are human-only. If autopilot ever calls
+    the validator on one, that's an enforcement bug — fail loudly so the
+    user notices."""
+    failures.append(
+        "task_type=framing-decision is human-only — autopilot should NEVER "
+        "execute this branch. Mark the node `human_only=true` in tree.json "
+        "and skip it via pick-next, or run /research-tree prune <id> with "
+        "an explicit reason."
+    )
+
+
+def _resolve_task_type(args, branch_dir: Path) -> str:
+    """v0.1.6 — figure out which task_type to validate against.
+
+    Resolution order:
+      1. Explicit ``--task-type`` CLI flag
+      2. tree.json node's ``task_type`` field (via branch_dir → ancestor lookup)
+      3. fallback to ``training`` (preserves v0.1.5 default behavior)
+    """
+    if getattr(args, "task_type", None):
+        return args.task_type
+    # Climb to find .research-tree/tree.json
+    cur = branch_dir
+    for _ in range(8):  # safety cap
+        candidate = cur / ".research-tree" / "tree.json"
+        if candidate.exists():
+            try:
+                state = json.loads(candidate.read_text())
+                node_id = branch_dir.name
+                node = state.get("nodes", {}).get(node_id)
+                if node and node.get("task_type"):
+                    return node["task_type"]
+            except (json.JSONDecodeError, OSError):
+                pass
+            break
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return "training"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("branch_dir", help="path to .research-tree/branches/<id>/")
@@ -460,6 +687,15 @@ def main() -> int:
     ap.add_argument("--audit-nonce-file", default=None,
                     help="path to AUDIT_NONCE file written by orchestrator before codex call. "
                          "Enforces nonce match + files_read SHA256 cross-check in CODEX_AUDIT.json.")
+    # v0.1.6 — task-type-aware validation
+    ap.add_argument(
+        "--task-type",
+        default=None,
+        choices=sorted(VALID_TASK_TYPES_VALIDATOR),
+        help="which task-type rule subset to enforce. If omitted, validator "
+             "reads the node's task_type from .research-tree/tree.json; "
+             "defaults to 'training' (v0.1.5 behavior) if neither is set.",
+    )
     args = ap.parse_args()
 
     branch_dir = Path(args.branch_dir).resolve()
@@ -469,24 +705,40 @@ def main() -> int:
         return 2
 
     nonce_path = Path(args.audit_nonce_file).resolve() if args.audit_nonce_file else None
+    task_type = _resolve_task_type(args, branch_dir)
 
     failures: list[str] = []
     warnings: list[str] = []
-    evidence: dict[str, Any] = {"branch_dir": str(branch_dir)}
+    evidence: dict[str, Any] = {"branch_dir": str(branch_dir), "task_type": task_type}
 
-    # Order matters: RESULT.md first because its absence makes other checks moot
-    table = check_result_md(branch_dir, failures, warnings, evidence)
-    check_data_rules(branch_dir, failures, evidence)
-    seed_sizes = check_training_rules(branch_dir, failures, evidence)
-    metrics = _load_metrics(branch_dir, failures)
-    check_metrics_json(branch_dir, failures, evidence)
-    if metrics is not None:
-        check_param_count_consistency(branch_dir, metrics, seed_sizes, failures, evidence)
-    check_ablations(branch_dir, failures, evidence)
-    check_reproducibility(branch_dir, failures, evidence)
-    if args.require_codex_audit:
-        check_codex_audit(branch_dir, nonce_path, failures, evidence)
-    check_done_ready(branch_dir, table, failures, evidence)
+    # framing-decision short-circuits — autopilot should never reach here
+    if task_type == "framing-decision":
+        check_framing_decision(branch_dir, failures, evidence)
+    else:
+        # RESULT.md + charter compliance table (task-type-aware rule subset)
+        table = check_result_md(branch_dir, failures, warnings, evidence, task_type=task_type)
+
+        # Dispatch task-type-specific physical artifact checks
+        if task_type == "training" or task_type == "mixed":
+            check_data_rules(branch_dir, failures, evidence)
+            seed_sizes = check_training_rules(branch_dir, failures, evidence)
+            metrics = _load_metrics(branch_dir, failures)
+            check_metrics_json(branch_dir, failures, evidence)
+            if metrics is not None:
+                check_param_count_consistency(branch_dir, metrics, seed_sizes, failures, evidence)
+            check_ablations(branch_dir, failures, evidence)
+        elif task_type == "audit":
+            check_audit_artifacts(branch_dir, failures, evidence)
+        elif task_type == "analysis":
+            check_analysis_artifacts(branch_dir, failures, evidence)
+        elif task_type == "data-acquisition":
+            check_data_acquisition_artifacts(branch_dir, failures, evidence)
+
+        # Common to all non-framing task types
+        check_reproducibility(branch_dir, failures, evidence)
+        if args.require_codex_audit:
+            check_codex_audit(branch_dir, nonce_path, failures, evidence)
+        check_done_ready(branch_dir, table, failures, evidence, task_type=task_type)
 
     if failures:
         verdict = "FAIL"
@@ -500,13 +752,14 @@ def main() -> int:
 
     report = {
         "verdict": verdict,
+        "task_type": task_type,
         "failures": failures,
         "warnings": warnings,
         "evidence": evidence,
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
-    print(f"\n=== charter_validator: {verdict} ===", file=sys.stderr)
+    print(f"\n=== charter_validator [{task_type}]: {verdict} ===", file=sys.stderr)
     for f in failures:
         print(f"  FAIL  {f}", file=sys.stderr)
     for w in warnings:

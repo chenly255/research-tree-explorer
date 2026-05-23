@@ -2,6 +2,81 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.6] — 2026-05-23
+
+Task-type-aware nodes. The v0.1.3 validator was hard-coded for training new
+foundation models (≥3 seed checkpoints, `param_count ≥ 10M`, ≥4 ablation
+subdirs) — fine for that case, but it auto-FAILs any audit / analysis /
+data-acquisition branch on contact, because those work modes physically
+cannot produce checkpoints. v0.1.6 makes the validator schema route on the
+node's `task_type` so post-hoc audit projects (e.g. evaluating a frozen
+model on within-atlas vs cross-batch protocols) can finally pass through
+the existing tree-exploration machinery without `--no-validate` hacks.
+
+### Added
+- Node schema fields: `task_type`, `depends_on`, `human_only`
+  (auto-migrated on load — pre-v0.1.6 trees default to `task_type=training`
+  / `depends_on=[]` / `human_only=false`, preserving v0.1.5 behavior).
+  Root node gets `task_type=mixed`.
+- `tree_state.py add` flags: `--task-type {training,audit,analysis,
+  data-acquisition,framing-decision,mixed}`, `--depends-on <csv ids>`,
+  `--human-only`.
+- `tree_state.py deps <node_id>` — prints `{satisfied, unmet, depends_on}`
+  JSON; exits 0 when satisfied, 1 when blocked. Lets shell scripts branch
+  on dependency readiness.
+- `charter_validator.py --task-type {training,audit,analysis,
+  data-acquisition,framing-decision,mixed}` (default: read from
+  `tree.json` node, fall back to `training`).
+- Four new task-type-specific physical-artifact schemas in the validator:
+  - **audit**: `audit_report.json` (cohort_summary + blindspot_signal),
+    `donor_bootstrap.json` (n_iter ≥ 1000), `protocol_comparison.json`
+    (within_atlas vs cross_batch vs over_estimation_ratio)
+  - **analysis**: `analysis_output.json` + optional `figures/*.{png,pdf,svg}`
+  - **data-acquisition**: `DATA_MANIFEST.json` with atlas_id / source_url
+    / local_path / checksum / n_cells / downloaded_at; validator confirms
+    the referenced local_path actually exists on disk
+  - **framing-decision**: validator immediately FAILs with a pointer to
+    set `human_only=true` and skip via `pick-next` (autopilot should
+    never reach a framing-decision branch)
+- `tests/test_task_type_aware.sh` — 20 cases covering field schema,
+  enum validation, dependency rejection, pick-next skipping, deps
+  command, and all five task-type validator paths.
+
+### Changed
+- `tree_state.py pick-next` now skips nodes with `human_only=true` and
+  nodes whose `depends_on` lists any non-completed prerequisite.
+  Existing scoring order (parent_score → shallowest depth) is preserved
+  among the eligible set.
+- `tree_state.py set` accepts `task_type=<enum>` (validates against the
+  enum) and `depends_on=<csv>` (parses comma-separated ids). `human_only`
+  was already a normal bool field.
+- `charter_validator.py check_result_md` only enforces the strict-rule
+  subset declared for the branch's task_type
+  (`TASK_TYPE_STRICT_RULES`). Training keeps all 8 rules; audit drops
+  2/3/5; analysis drops 1/2/3/5; data-acquisition drops 2/3/4/5;
+  framing-decision short-circuits.
+- `charter_validator.py` output JSON gains a `task_type` field for
+  downstream tooling. Stderr summary line now reads
+  `=== charter_validator [<task_type>]: <verdict> ===`.
+- `templates/RESEARCH_CHARTER.md` adds two sections: §"Task type modes"
+  (per-mode strict rule subset + required physical artifacts) and
+  §"Dependency declaration".
+- `skills/research-tree/SKILL.md` `expand` proposer schema now includes
+  `task_type` + `depends_on` + `human_only` per candidate.
+  `execute` subagent prompt now selects a task-type-specific artifact
+  block (training / audit / analysis / data-acquisition) instead of
+  hard-coding the training block.
+
+### Migration notes
+- **Old trees keep working**. `load_state()` backfills the new fields on
+  read, so `tree.json` files created by v0.1.0-v0.1.5 are still
+  consumable. No `init --force` required.
+- **Old validator invocations keep working**. `charter_validator.py`
+  without `--task-type` reads the node's task_type from `tree.json`
+  (climbing up to find `.research-tree/`) and defaults to `training`
+  when no tree state is found. Existing CI scripts that pass only
+  `branch_dir` are unchanged in behavior.
+
 ## [0.1.5] — 2026-05-23
 
 Smarter branching cadence: stop forcing 2-4 candidates at every node, let the

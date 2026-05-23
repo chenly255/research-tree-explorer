@@ -48,6 +48,19 @@ LOCK_FILE_NAME = "tree.lock"
 SCHEMA_VERSION = "0.2"
 
 VALID_STATUSES = {"pending", "expanded", "running", "completed", "dead"}
+
+# v0.1.6 — task_type: each branch can declare what KIND of work it does, so
+# the charter validator picks the right schema (e.g. an audit branch does
+# not produce checkpoints, so checking for ≥3 seed checkpoints is nonsense).
+# `training` is the default and preserves all v0.1.5 behavior.
+VALID_TASK_TYPES = {
+    "training",            # standard ML training run with checkpoints + multi-seed (v0.1.5 default)
+    "audit",               # post-hoc evaluation/audit on frozen models, no new checkpoints
+    "analysis",            # data analysis / statistics / figure generation, no model artifacts
+    "data-acquisition",    # download + verify external dataset, produces raw data manifests
+    "framing-decision",    # human-only paper framing / venue / narrative decision; autopilot skips
+    "mixed",               # heterogeneous workload; defers to charter for per-branch validation
+}
 VALID_KINDS = {"root", "approach", "architecture", "experiment", "ablation", "narrative", "custom"}
 
 # Fields the `set` command is allowed to write. Notably EXCLUDES `status` —
@@ -58,6 +71,8 @@ SET_ALLOWED_KEYS = {
     "description", "score", "death_reason", "death_evidence",
     "done_ready", "completion_proof", "junction_audit_id", "branch_dir",
     "direct_executable",
+    # v0.1.6 — task-type-aware nodes
+    "task_type", "depends_on", "human_only",
 }
 
 # Session step counter — autopilot reports `should_pause: true` when this many
@@ -109,7 +124,15 @@ def load_state(root: Path) -> dict[str, Any]:
     if not p.exists():
         sys.exit(f"ERROR: no tree found at {p}. Run `tree_state.py init <idea>` first.")
     with p.open() as f:
-        return json.load(f)
+        state = json.load(f)
+    # v0.1.6 — auto-migrate pre-v0.1.6 trees by backfilling task-type fields.
+    # Trees created before v0.1.6 lack task_type/depends_on/human_only; treat
+    # them as the conservative training default so v0.1.5 behavior is preserved.
+    for n in state.get("nodes", {}).values():
+        n.setdefault("task_type", "mixed" if n.get("kind") == "root" else "training")
+        n.setdefault("depends_on", [])
+        n.setdefault("human_only", False)
+    return state
 
 
 def save_state(root: Path, state: dict[str, Any]) -> None:
@@ -168,6 +191,11 @@ def _do_init(args, root: Path) -> None:
                 "junction_audit_id": None,
                 "branch_dir": None,
                 "children": [],
+                # v0.1.6 — task-type-aware fields (root inherits "mixed" by default;
+                # individual child branches will declare their own task_type at add time)
+                "task_type": "mixed",
+                "depends_on": [],
+                "human_only": False,
                 "created_at": now_iso(),
             }
         },
@@ -211,6 +239,20 @@ def cmd_add(args) -> None:
         if args.kind not in VALID_KINDS:
             sys.exit(f"ERROR: invalid kind {args.kind!r}. Valid: {sorted(VALID_KINDS)}")
 
+        # v0.1.6 — validate task_type and depends_on
+        task_type = getattr(args, "task_type", None) or "training"
+        if task_type not in VALID_TASK_TYPES:
+            sys.exit(
+                f"ERROR: invalid task_type {task_type!r}. "
+                f"Valid: {sorted(VALID_TASK_TYPES)}"
+            )
+        depends_on_raw = getattr(args, "depends_on", None) or ""
+        depends_on = [d.strip() for d in depends_on_raw.split(",") if d.strip()]
+        for dep_id in depends_on:
+            if dep_id not in state["nodes"]:
+                sys.exit(f"ERROR: depends_on references unknown node {dep_id!r}.")
+        human_only = bool(getattr(args, "human_only", False))
+
         parent_node = state["nodes"][parent_id]
         constraints = state["global_constraints"]
 
@@ -247,6 +289,10 @@ def cmd_add(args) -> None:
             "branch_dir": f"{STATE_DIR_NAME}/branches/{new_id}",
             "children": [],
             "direct_executable": False,
+            # v0.1.6 — task-type-aware fields
+            "task_type": task_type,
+            "depends_on": depends_on,
+            "human_only": human_only,
             "created_at": now_iso(),
         }
         state["nodes"][new_id] = new_node
@@ -269,6 +315,19 @@ def parse_kv(items: list[str]) -> dict[str, Any]:
         if "=" not in it:
             sys.exit(f"ERROR: expected key=value, got {it!r}.")
         k, v = it.split("=", 1)
+        # v0.1.6 — depends_on stores a list; accept comma-separated values from `set`
+        if k == "depends_on":
+            out[k] = [x.strip() for x in v.split(",") if x.strip()] if v else []
+            continue
+        # v0.1.6 — task_type must be one of the valid enum values
+        if k == "task_type":
+            if v not in VALID_TASK_TYPES:
+                sys.exit(
+                    f"ERROR: invalid task_type {v!r}. "
+                    f"Valid: {sorted(VALID_TASK_TYPES)}"
+                )
+            out[k] = v
+            continue
         if v.lower() == "true":
             out[k] = True
         elif v.lower() == "false":
@@ -465,30 +524,81 @@ def cmd_list(args) -> None:
         print(f"  {marker} [{n['id']:<6}] depth={n['depth']} score={score:>5} {n['kind']:<12} {n['title']}")
 
 
+def _deps_satisfied(state: dict, node: dict) -> tuple[bool, list[str]]:
+    """v0.1.6 — return (all_satisfied, list_of_unmet_dep_ids).
+
+    A dependency is satisfied when the referenced node's status is
+    `completed`. `dead` does NOT count: if a prerequisite died, the
+    dependent branch is blocked (autopilot may later mark it dead too).
+    """
+    unmet = []
+    for dep_id in node.get("depends_on", []) or []:
+        dep_node = state["nodes"].get(dep_id)
+        if dep_node is None:
+            # broken reference — treat as unmet
+            unmet.append(dep_id)
+            continue
+        if dep_node.get("status") != "completed":
+            unmet.append(dep_id)
+    return (len(unmet) == 0, unmet)
+
+
 def cmd_pick_next(args) -> None:
     """Pick the next leaf to work on.
 
     Priority:
       1. Status == pending (never touched)
-      2. Status == expanded but has no completed/dead children yet (junction needing audit)
-      3. Highest parent score (deepen winners)
-      4. Shallowest depth as tiebreak
+      2. v0.1.6 — skip nodes with `human_only=true` (autopilot must not touch them)
+      3. v0.1.6 — skip nodes whose `depends_on` lists any non-completed node
+      4. Highest parent score (deepen winners)
+      5. Shallowest depth as tiebreak
     """
     root = Path(args.project_root).resolve()
     state = load_state(root)
     candidates = []
     for n in state["nodes"].values():
-        if n["status"] == "pending":
-            parent_score = (
-                state["nodes"][n["parent"]]["score"] if n["parent"] else 1.0
-            )
-            parent_score = parent_score if parent_score is not None else 0.5
-            candidates.append((parent_score, -n["depth"], n["id"]))
+        if n["status"] != "pending":
+            continue
+        # v0.1.6 — autopilot must not pick human-only nodes (paper framing
+        # decisions, venue choice, etc. belong to the user)
+        if n.get("human_only", False):
+            continue
+        # v0.1.6 — skip nodes blocked by unmet dependencies
+        ok, _ = _deps_satisfied(state, n)
+        if not ok:
+            continue
+        parent_score = (
+            state["nodes"][n["parent"]]["score"] if n["parent"] else 1.0
+        )
+        parent_score = parent_score if parent_score is not None else 0.5
+        candidates.append((parent_score, -n["depth"], n["id"]))
     if not candidates:
         print("NONE")
         return
     candidates.sort(reverse=True)
     print(candidates[0][2])
+
+
+def cmd_deps(args) -> None:
+    """v0.1.6 — show dependency status for one node.
+
+    stdout: JSON {node_id, depends_on, unmet, satisfied}
+    Exit code: 0 if satisfied, 1 if unmet (so callers can branch on it).
+    """
+    root = Path(args.project_root).resolve()
+    state = load_state(root)
+    node = state["nodes"].get(args.node_id)
+    if node is None:
+        sys.exit(f"ERROR: node {args.node_id!r} not found.")
+    ok, unmet = _deps_satisfied(state, node)
+    report = {
+        "node_id": args.node_id,
+        "depends_on": node.get("depends_on", []) or [],
+        "unmet": unmet,
+        "satisfied": ok,
+    }
+    print(json.dumps(report, indent=2))
+    return 0 if ok else 1
 
 
 def cmd_tree(args) -> None:
@@ -697,6 +807,23 @@ def main() -> None:
     p_add.add_argument("kind", help=f"one of: {sorted(VALID_KINDS)}")
     p_add.add_argument("title")
     p_add.add_argument("--description", default=None)
+    # v0.1.6 — task-type-aware nodes
+    p_add.add_argument(
+        "--task-type",
+        default="training",
+        choices=sorted(VALID_TASK_TYPES),
+        help="kind of work this branch performs (drives validator schema, default: training)",
+    )
+    p_add.add_argument(
+        "--depends-on",
+        default=None,
+        help="comma-separated node_ids that must complete before pick-next selects this node",
+    )
+    p_add.add_argument(
+        "--human-only",
+        action="store_true",
+        help="mark branch as human-only (autopilot pick-next skips; user must execute manually)",
+    )
     p_add.set_defaults(func=cmd_add)
 
     p_set = sub.add_parser(
@@ -752,6 +879,14 @@ def main() -> None:
 
     p_pick = sub.add_parser("pick-next", help="pick next leaf to expand/execute")
     p_pick.set_defaults(func=cmd_pick_next)
+
+    # v0.1.6 — dependency inspection
+    p_deps = sub.add_parser(
+        "deps",
+        help="show dependency status for one node (exit 0 if satisfied, 1 if not)",
+    )
+    p_deps.add_argument("node_id")
+    p_deps.set_defaults(func=cmd_deps)
 
     p_tree = sub.add_parser("tree", help="ASCII tree visualization")
     p_tree.set_defaults(func=cmd_tree)

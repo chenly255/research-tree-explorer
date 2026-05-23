@@ -13,6 +13,18 @@ You are running the `research-tree` skill. Your job is to drive a **tree-shaped 
 
 **Hardline enforcement** (v0.1.3): the charter is NOT just a prompt — it is enforced by `scripts/charter_validator.py`, a separate program that runs after every branch and checks for the **physical files** (test_split.json with hash, ≥3 seed checkpoint dirs, metrics.json with param_count ≥10M and downstream task p-values, ≥4 ablation subdirs, requirements.txt). On top of that, every passing branch goes through a **fresh codex thread** for external adversarial audit before being marked `completed`. A subagent that fabricates RESULT.md text without the backing files gets marked dead by the validator, period. **Never skip steps 6b–6d in `execute`. Never re-spawn the subagent to "try again" after a validator FAIL — that defeats the purpose.**
 
+**v0.1.6 — task-type-aware nodes**: not every research branch is a training
+run. A branch can declare `task_type` at `add` time (training / audit /
+analysis / data-acquisition / framing-decision / mixed), and the validator
+enforces a task-specific rule subset (e.g. audit branches don't need
+checkpoints; data-acquisition branches need a DATA_MANIFEST.json with
+checksum-verified files instead). Nodes can also declare `depends_on` for
+sequencing (pick-next skips nodes with unmet prerequisites) and `human_only`
+for paper-writing / venue / narrative decisions that the user must resolve
+(autopilot pick-next skips them entirely). This makes the skill safe to use
+on audit-style projects (post-hoc model evaluation, protocol critique) where
+the v0.1.5 training-only validator would force every branch dead.
+
 ## Locations and helpers
 
 The skill ships with two Python helpers. Resolve them via this chain (works regardless of how the skill was installed):
@@ -103,12 +115,24 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
        - 1 candidate: there's an obvious next step, but it's worth keeping the option open to extend later
        - **skip expansion**: this is the canonical/standard way to do this — branching is just busywork. Examples: "evaluate the trained model on the held-out test set" (no fork, you just do it), "compute the standard ARI metric" (no fork, this IS the method), "run the next obvious ablation that the charter requires"
      - Decide as a human researcher would. Strongly prefer skipping expansion over forcing 3 fake-different "candidates" that are all the same thing.
+   - **v0.1.6 — task-type tagging**: the proposer MUST also declare a
+     `task_type` for each candidate (one of: `training`, `audit`,
+     `analysis`, `data-acquisition`, `framing-decision`, `mixed`).
+     This drives the validator schema later. If a candidate represents a
+     paper-writing / venue / narrative choice that only the user can
+     resolve, set `task_type: "framing-decision"` AND `human_only: true`
+     so autopilot skips it. If a candidate can only run after another
+     node finishes (e.g. a repair head depends on the audit identifying
+     blindspots), set `depends_on: ["<sibling_id>", ...]`.
    - tell it: "Return ONLY a JSON object (not a bare array), schema:
      ```json
      {
        "skip_expansion": false,
        "candidates": [
          {"kind": "approach|architecture|experiment|ablation|narrative|custom",
+          "task_type": "training|audit|analysis|data-acquisition|framing-decision|mixed",
+          "human_only": false,
+          "depends_on": [],
           "title": "<≤80 chars>",
           "description": "<2-4 sentences>"}
        ]
@@ -133,7 +157,13 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
    - If `skip_expansion: true` BUT parent depth == 0: ignore the skip (charter forbids it at root). Tell the user via stderr "WARN: proposer requested skip_expansion at depth 0 — overriding per charter §2". Treat as if proposer returned 0 candidates and re-prompt or error.
    - Otherwise, for each candidate in `candidates[]`:
      ```bash
-     python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<description>"
+     # v0.1.6: pass task_type / depends_on / human_only to add command.
+     # Defaults (training / [] / false) are safe omissions for backward compat.
+     EXTRA=""
+     [ -n "<task_type>" ] && EXTRA="$EXTRA --task-type <task_type>"
+     [ -n "<depends_on_csv>" ] && EXTRA="$EXTRA --depends-on <depends_on_csv>"
+     [ "<human_only>" = "true" ] && EXTRA="$EXTRA --human-only"
+     python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<description>" $EXTRA
      ```
 5. (Optional, only if `mcp__codex__codex` is available) Spawn a codex fresh-thread red-team: pass the file paths `/tmp/rt_parent.json` + `/tmp/rt_siblings.txt` + the new children's ids, ask "any of these mutually redundant or obviously dominated?". Apply via `set status=dead death_reason=...` before continuing. **Never use codex-reply — fresh thread only.**
 6. Log the action:
@@ -182,14 +212,38 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
 
      **Pure-compute exceptions**: if your task takes < 60 seconds total (small unit test, file inspection, small classifier on toy data) you may run it foreground. In that case, do NOT write EXECUTOR.json — just produce RESULT.md or DEAD.md directly. The orchestrator distinguishes the two modes by EXECUTOR.json presence."
    - **Pastes RESEARCH_CHARTER.md in full and says: "Obey the charter. The final RESULT.md MUST end with the charter compliance audit table from §Charter compliance audit format. Any FAIL on a (strict) rule means you write DEAD.md instead of RESULT.md, with death_reason='charter_violation: <which rule>'. Honest failure beats fake success."**
-   - Says "the BACKGROUND PROCESS (not the subagent itself) writes `RESULT.md` at completion, with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, DONE_READY=<true|false>, then the charter compliance audit table"
-   - **Says: "You also MUST produce these PHYSICAL artifacts inside the branch_dir, because a programmatic validator will check for them after you return — text claims alone are not enough:**
-     - `data/test_split.json` — JSON with keys `test_ids`, `hash`, `created_at`
-     - `checkpoints/seed_0/`, `seed_1/`, `seed_2/` — each containing at least one `.pt`/`.pth`/`.safetensors`/`.ckpt` file
-     - `metrics.json` — must include `param_count` (int ≥ 10M), `seeds` (list of ≥3), `downstream_tasks` (dict where each task has `metric`, `std`, `baseline_score`, `p_value`), `gpu_hours_used`, `wall_clock_hours`
-     - `ablations/` — at least 4 subdirs (headline component, scale, data efficiency, cross-batch), each with a result file
-     - `requirements.txt` or `environment.yml`
-     - If you set `DONE_READY=true`: also `KILL_ARGUMENT.md` with a self-rejection memo + defense
+   - **v0.1.6 — task_type-aware artifact requirements**. Read the node's `task_type` field (from `python3 "$TREE_STATE" get <node_id>` → `.task_type`) and tell the subagent the artifact set that matches its task_type. The orchestrator MUST select ONE of the following blocks based on the node's `task_type`:
+
+     **For `task_type=training` (default, v0.1.5 behavior)**:
+     - Says "the BACKGROUND PROCESS (not the subagent itself) writes `RESULT.md` at completion, with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, DONE_READY=<true|false>, then the charter compliance audit table"
+     - **Says: "You also MUST produce these PHYSICAL artifacts inside the branch_dir, because a programmatic validator will check for them after you return — text claims alone are not enough:**
+       - `data/test_split.json` — JSON with keys `test_ids`, `hash`, `created_at`
+       - `checkpoints/seed_0/`, `seed_1/`, `seed_2/` — each containing at least one `.pt`/`.pth`/`.safetensors`/`.ckpt` file
+       - `metrics.json` — must include `param_count` (int ≥ 10M), `seeds` (list of ≥3), `downstream_tasks` (dict where each task has `metric`, `std`, `baseline_score`, `p_value`), `gpu_hours_used`, `wall_clock_hours`
+       - `ablations/` — at least 4 subdirs (headline component, scale, data efficiency, cross-batch), each with a result file
+       - `requirements.txt` or `environment.yml`
+       - If you set `DONE_READY=true`: also `KILL_ARGUMENT.md` with a self-rejection memo + defense
+
+     **For `task_type=audit` (post-hoc evaluation on a frozen model)**:
+     - "RESULT.md must include `METRIC=<float>` (over_estimation_ratio is the headline metric), `KEY_FINDING`, `COST`, `ARTIFACTS`, `DONE_READY`, plus the charter compliance table covering rules 0/1/4/7/8 only (skip 2/3/5 — no new training)."
+     - "You MUST produce these PHYSICAL artifacts in the branch_dir:
+       - `audit_report.json` — contains `cohort_summary` (n_cohort_cells, n_control_cells, n_donor_cohort, n_donor_control) AND `blindspot_signal` (fn_delta, ci_low, ci_hi, verdict)
+       - `donor_bootstrap.json` — donor-level bootstrap with `n_iter` ≥ 1000, plus per-donor leave-one-out sensitivity
+       - `protocol_comparison.json` — `within_atlas_fn_delta`, `cross_batch_fn_delta`, `over_estimation_ratio` (this is the methodological core of v0.1.6 audit framing)
+       - `requirements.txt` or `environment.yml`"
+     - "NO checkpoint dirs, NO metrics.json with param_count, NO ablations/ — these are nonsense for an audit task."
+
+     **For `task_type=analysis` (statistics / figures / report)**:
+     - "RESULT.md must include `METRIC=<float>`, key claims, charter table covering rules 0/4/7/8 only."
+     - "PHYSICAL artifacts: `analysis_output.json` (structured statistics output) + optionally `figures/*.png|*.pdf|*.svg` + `requirements.txt`. NO checkpoints, NO test_split, NO metrics.json with param_count."
+
+     **For `task_type=data-acquisition` (download + verify external data)**:
+     - "RESULT.md must include `METRIC=<float>` (set to n_cells downloaded), `KEY_FINDING` (one line: which atlas, how many cells, where it lives), `ARTIFACTS`. Charter table covers rules 0/1/7."
+     - "PHYSICAL artifacts: `DATA_MANIFEST.json` with required keys (`atlas_id`, `source_url`, `local_path`, `checksum`, `n_cells`, `downloaded_at`) where the referenced `local_path` MUST exist on disk after the download finishes. Plus `requirements.txt` or the download script."
+     - "NO model artifacts; data-acquisition is a pure infrastructure step."
+
+     **For `task_type=framing-decision`**: the orchestrator should NEVER reach this step. If it does, log the bug and write DEAD.md with `death_reason='framing-decision is human-only; autopilot must not execute it (skip in pick-next by setting human_only=true)'`.
+
    - **Bluntly says: "Do NOT fabricate these files with fake content. A separate validator AND an external codex auditor will run after you, and both will catch lies. Faking files = branch marked dead with `death_reason='validator: <detail>'`."**
    - Says "if you hit a blocker that makes the hypothesis untestable, write a `DEAD.md` with the blocker description instead — that is a valid outcome"
    - **Anti-laziness reminder**: "Do NOT take shortcuts because the deadline is tight or the data is awkward. If the charter mandates full-data training and you can only finish in budget with a subset, write DEAD.md with reason 'needs full-scale compute, cannot honestly complete in pilot budget'. The user values honest failure over fake success. The dead-branch atlas is part of the deliverable."

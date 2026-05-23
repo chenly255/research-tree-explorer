@@ -113,7 +113,11 @@ Missing ablations = the winner is NOT done, even if downstream numbers look good
 
 ## Charter compliance audit format (required in every RESULT.md)
 
-Append this section to RESULT.md at the end:
+Append this section to RESULT.md at the end. **v0.1.6**: only include the
+rows that apply to your `task_type` (see §"Task type modes" below). The
+validator only enforces the rule subset for your declared `task_type`.
+
+Default (full table — required for `task_type=training` / `mixed`):
 
 ```
 ## Charter compliance
@@ -133,6 +137,84 @@ Append this section to RESULT.md at the end:
 
 Any FAIL on a (strict) rule → branch is dead, no exceptions.
 WARN on a (soft) rule → branch alive but flagged in junction audit.
+
+## Task type modes (v0.1.6)
+
+Different kinds of work need different acceptance criteria. The
+`charter_validator.py` reads each node's `task_type` field (set at `add`
+time via `--task-type`) and enforces the relevant rule subset only.
+
+### `training` (default — v0.1.5 behavior preserved)
+- All 8 strict rules enforced
+- Physical artifacts required: `data/test_split.json` (with hash), ≥3
+  `checkpoints/seed_*/` dirs each with a real checkpoint file,
+  `metrics.json` (param_count ≥10M, ≥3 seeds, per-task metric/std/p_value),
+  ≥4 `ablations/` subdirs, `requirements.txt`
+- This is the default when `task_type` is unspecified — old projects do
+  not need to migrate
+
+### `audit` (post-hoc evaluation on frozen models)
+- Strict rules enforced: 0, 1, 4, 7, 8 (skipping 2 architecture, 3
+  training, 5 ablation because no new model is trained)
+- Physical artifacts required:
+  - `audit_report.json` — with `cohort_summary` and `blindspot_signal`
+    objects (cohort/control sizes, FN/FP delta, signal verdict)
+  - `donor_bootstrap.json` — with `n_iter ≥ 1000` (donor-level 95% CI)
+  - `protocol_comparison.json` — with `within_atlas_fn_delta`,
+    `cross_batch_fn_delta`, `over_estimation_ratio` (this is the
+    methodological core: did the audit protocol over-estimate signal?)
+  - `requirements.txt`
+- Use when: you are evaluating an already-trained model on new data,
+  computing within-atlas vs cross-batch comparisons, running donor
+  bootstrap on existing embeddings, etc.
+
+### `analysis` (statistics / figure generation / report)
+- Strict rules enforced: 0, 4, 7, 8 (skipping data / architecture /
+  training / ablation — analysis consumes prior data and produces
+  derived outputs)
+- Physical artifacts required:
+  - `analysis_output.json` — structured output of the analysis
+    (statistics, computed metrics, decision recommendations)
+  - `figures/` directory with ≥1 `*.png` / `*.pdf` / `*.svg` (optional
+    if the analysis is statistics-only)
+  - `requirements.txt`
+- Use when: generating paper figures, post-hoc statistics across branches,
+  producing comparison tables
+
+### `data-acquisition` (download + verify external dataset)
+- Strict rules enforced: 0, 1, 7 (skipping evaluation / training because
+  no model interaction happens)
+- Physical artifacts required:
+  - `DATA_MANIFEST.json` — with `atlas_id`, `source_url`, `local_path`,
+    `checksum`, `n_cells`, `downloaded_at`; the validator confirms the
+    referenced `local_path` actually exists on disk
+  - download / preprocessing script (any file is fine; recorded in
+    `DATA_MANIFEST.json`'s `requirements.txt` reference)
+- Use when: pulling an external atlas from CELLxGENE Census / GEO /
+  figshare, verifying integrity, registering as available for
+  downstream `audit` / `training` branches
+
+### `framing-decision` (human-only narrative / venue choice)
+- No strict rules; validator immediately FAILS if autopilot runs this
+- Use when: a branch represents a paper-writing choice (which figure
+  leads / which venue to target / wording of the headline). These are
+  user decisions, not autopilot decisions.
+- Always combine with `--human-only` so `pick-next` skips the node
+
+## Dependency declaration (v0.1.6)
+
+Use `--depends-on <id1>,<id2>,...` at `add` time when a branch can only
+run after another branch has completed. Example: a `training` branch for
+a repair head depends on the `audit` branch that identified the
+per-FM blindspot it should repair.
+
+`pick-next` skips nodes with unmet dependencies (any dep that is not
+yet `status=completed` blocks selection). Once the prerequisite
+completes, the dependent node becomes eligible automatically.
+
+Use `python3 tree_state.py deps <node_id>` to inspect a node's
+dependency status (returns JSON with `satisfied: true/false` and a list
+of unmet dep ids).
 
 ## Done criteria
 

@@ -12,6 +12,8 @@ You hit `/research-tree init "<your idea>"`, walk away, and come back to `FINAL_
 
 **v0.1.5 — smart branching cadence**: the proposer no longer forces 2-4 fake-different candidates at every node — at depth ≥1 it can return `skip_expansion: true` for canonical steps (no design choice → execute directly). `autopilot --continuous` chains steps back-to-back without `/loop`'s 30-min sleep until every live node is blocked on background work or the session step counter (default 20) hits its threshold, at which point you're told to restart Claude Code for a clean context. Best of both: `/loop 30m /research-tree autopilot --continuous --silent` chews through quick chained work between `/loop` ticks but never accumulates more than ~20 steps of context per session.
 
+**v0.1.6 — task-type-aware nodes**: a tree branch can now declare what KIND of work it does — `training` (default, v0.1.5 behavior, needs checkpoints + ablations), `audit` (post-hoc evaluation on a frozen model, needs `audit_report.json` + `donor_bootstrap.json` + `protocol_comparison.json` instead), `analysis` (figures + statistics), `data-acquisition` (downloaded atlas with checksum-verified manifest), or `framing-decision` (paper-writing / venue choice — `human_only`, autopilot skips entirely). The validator routes on `task_type` and applies the appropriate physical-artifact schema, so audit-style projects no longer auto-FAIL because they have no checkpoints. Nodes can also declare `depends_on` to express sequencing (a repair-head training branch depends on the audit that named its target blindspot); `pick-next` skips nodes with unmet dependencies. Old trees and old validator invocations are unchanged in behavior — `task_type` defaults to `training`.
+
 ---
 
 ## What this is, in one diagram
