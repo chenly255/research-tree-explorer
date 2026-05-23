@@ -137,6 +137,14 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
           root the project uses (read from RESEARCH_BRIEF.md or
           RESEARCH_CHARTER.md §Data sources). If neither is set, scan
           `data/`, `datasets/`, `atlases/` at the project root.
+          **Prefer the machine-readable inventory** when present:
+          `cat data/atlases/INDEX.json` (sc-bias convention) lists
+          `{atlas_id, path, n_cells, disease, tissue, paper_doi,
+          collection_id, dataset_id, manifest_path}` for every atlas
+          already on disk. A matching `atlas_id` OR `(paper_doi,
+          disease)` tuple means the data exists — do NOT propose a
+          data-acquisition sibling. Inventory format documented in
+          `examples/data-acquisition/README.md`.
        2. For each candidate-of-interest atlas the proposer names, if
           there is no matching subdirectory or .h5ad with the atlas's
           slug in the filename, the proposer MUST insert a

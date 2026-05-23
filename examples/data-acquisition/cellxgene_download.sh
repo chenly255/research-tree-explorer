@@ -203,21 +203,32 @@ except Exception as e_ad:
     print(f"# anndata read failed ({e_ad!r}); falling back to h5py", file=sys.stderr)
     import h5py
     with h5py.File(path, "r") as f:
-        # .h5ad layout: /obs/_index for cell ids, /var/_index for gene ids
-        # (older variants use /obs/index — try both)
-        for key in ("_index", "index"):
-            if "obs" in f and key in f["obs"]:
-                n_cells = int(f["obs"][key].shape[0]); break
-        for key in ("_index", "index"):
-            if "var" in f and key in f["var"]:
-                n_genes = int(f["var"][key].shape[0]); break
-        if n_cells is None and "X" in f:
-            n_cells = int(f["X"].shape[0])
-            n_genes = int(f["X"].shape[1])
+        # Modern .h5ad: X is a CSR group whose attrs['shape'] = (n_cells, n_genes).
+        # Try this FIRST — on newer schemas obs uses categorical groups (not flat
+        # datasets) and the index column name varies (attrs['_index']), so the
+        # obs path can fail silently. X attrs is the reliable single source.
+        if "X" in f and isinstance(f["X"], h5py.Group):
+            shp = f["X"].attrs.get("shape")
+            if shp is not None and len(shp) == 2:
+                n_cells, n_genes = int(shp[0]), int(shp[1])
+        # Older .h5ad: X is a flat dataset
+        if n_cells is None and "X" in f and isinstance(f["X"], h5py.Dataset):
+            n_cells, n_genes = int(f["X"].shape[0]), int(f["X"].shape[1])
+        # Last resort: obs/var index dataset (lookup name in attrs first)
+        if n_cells is None and "obs" in f:
+            idx = f["obs"].attrs.get("_index", "_index")
+            if isinstance(idx, bytes): idx = idx.decode()
+            if idx in f["obs"] and isinstance(f["obs"][idx], h5py.Dataset):
+                n_cells = int(f["obs"][idx].shape[0])
+        if n_genes is None and "var" in f:
+            idx = f["var"].attrs.get("_index", "_index")
+            if isinstance(idx, bytes): idx = idx.decode()
+            if idx in f["var"] and isinstance(f["var"][idx], h5py.Dataset):
+                n_genes = int(f["var"][idx].shape[0])
         if "uns" in f and "schema_version" in f["uns"]:
             try:
-                schema = f["uns"]["schema_version"][()].decode() if isinstance(
-                    f["uns"]["schema_version"][()], bytes) else str(f["uns"]["schema_version"][()])
+                v = f["uns"]["schema_version"][()]
+                schema = v.decode() if isinstance(v, bytes) else str(v)
             except Exception:
                 pass
 if n_cells is None:

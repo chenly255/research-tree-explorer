@@ -159,15 +159,23 @@ except Exception as e:
     print(f"# anndata failed ({e!r}); falling back to h5py", file=sys.stderr)
     import h5py
     with h5py.File(path, "r") as f:
-        for key in ("_index", "index"):
-            if "obs" in f and key in f["obs"]:
-                n_cells = int(f["obs"][key].shape[0]); break
-        for key in ("_index", "index"):
-            if "var" in f and key in f["var"]:
-                n_genes = int(f["var"][key].shape[0]); break
-        if n_cells is None and "X" in f:
-            n_cells = int(f["X"].shape[0])
-            n_genes = int(f["X"].shape[1])
+        # Modern .h5ad: X is CSR group with attrs['shape']; reliable single source
+        if "X" in f and isinstance(f["X"], h5py.Group):
+            shp = f["X"].attrs.get("shape")
+            if shp is not None and len(shp) == 2:
+                n_cells, n_genes = int(shp[0]), int(shp[1])
+        if n_cells is None and "X" in f and isinstance(f["X"], h5py.Dataset):
+            n_cells, n_genes = int(f["X"].shape[0]), int(f["X"].shape[1])
+        if n_cells is None and "obs" in f:
+            idx = f["obs"].attrs.get("_index", "_index")
+            if isinstance(idx, bytes): idx = idx.decode()
+            if idx in f["obs"] and isinstance(f["obs"][idx], h5py.Dataset):
+                n_cells = int(f["obs"][idx].shape[0])
+        if n_genes is None and "var" in f:
+            idx = f["var"].attrs.get("_index", "_index")
+            if isinstance(idx, bytes): idx = idx.decode()
+            if idx in f["var"] and isinstance(f["var"][idx], h5py.Dataset):
+                n_genes = int(f["var"][idx].shape[0])
 if n_cells is None:
     print("FAIL: could not read n_cells from h5ad", file=sys.stderr); sys.exit(1)
 print(n_cells); print(n_genes if n_genes is not None else 0)
