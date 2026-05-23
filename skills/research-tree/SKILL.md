@@ -36,10 +36,14 @@ TREE_STATE="$RTE_REPO/scripts/tree_state.py"
 SYNTHESIZE="$RTE_REPO/scripts/synthesize_report.py"
 VALIDATOR="$RTE_REPO/scripts/charter_validator.py"
 STALE_HANDLER="$RTE_REPO/scripts/stale_running_handler.py"
+SIGNAL_DETECTOR="$RTE_REPO/scripts/signal_detector.py"
+DATA_EXAMPLES="$RTE_REPO/examples/data-acquisition"
 [ -f "$TREE_STATE" ] || TREE_STATE="$SKILL_DIR/../../scripts/tree_state.py"
 [ -f "$SYNTHESIZE" ] || SYNTHESIZE="$SKILL_DIR/../../scripts/synthesize_report.py"
 [ -f "$VALIDATOR" ] || VALIDATOR="$SKILL_DIR/../../scripts/charter_validator.py"
 [ -f "$STALE_HANDLER" ] || STALE_HANDLER="$SKILL_DIR/../../scripts/stale_running_handler.py"
+[ -f "$SIGNAL_DETECTOR" ] || SIGNAL_DETECTOR="$SKILL_DIR/../../scripts/signal_detector.py"
+[ -d "$DATA_EXAMPLES" ] || DATA_EXAMPLES="$SKILL_DIR/../../examples/data-acquisition"
 ```
 
 If neither path exists, abort with a clear error pointing to https://github.com/lily/research-tree-explorer.
@@ -124,20 +128,67 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
      so autopilot skips it. If a candidate can only run after another
      node finishes (e.g. a repair head depends on the audit identifying
      blindspots), set `depends_on: ["<sibling_id>", ...]`.
+   - **v0.1.7 — auto-propose data-acquisition siblings**. Before
+     finalizing a candidate that NEEDS an external dataset (audit on
+     atlas X, training on cohort Y), the proposer MUST check whether
+     that dataset is locally present:
+       1. The orchestrator gives the proposer two paths to grep:
+          `data/atlases/` (sc-bias convention) and any other dataset
+          root the project uses (read from RESEARCH_BRIEF.md or
+          RESEARCH_CHARTER.md §Data sources). If neither is set, scan
+          `data/`, `datasets/`, `atlases/` at the project root.
+       2. For each candidate-of-interest atlas the proposer names, if
+          there is no matching subdirectory or .h5ad with the atlas's
+          slug in the filename, the proposer MUST insert a
+          `task_type=data-acquisition` SIBLING candidate that pulls
+          that atlas first, and tag the original candidate with
+          `depends_on: ["<the_new_data_acquisition_id>"]`. Use a
+          placeholder dep id of the form `<atlas_slug>_DOWNLOAD` — the
+          orchestrator will resolve real IDs after `add` calls return.
+       3. Each data-acquisition candidate MUST include in its
+          `description` the canonical source (e.g.
+          "CELLxGENE Discover dataset <UUID>" or "GEO ftp
+          <accession>") and the expected n_cells (from paper / lit
+          scout). This lets the executor subagent pick the right
+          template (`cellxgene_download.sh` vs
+          `geo_figshare_download.sh`) without re-doing discovery.
+       4. If the proposer cannot determine the source URL or UUID
+          (e.g., paper cites GEO but no accession number visible),
+          spawn `cellxgene_discover.py search --query "<keywords>"`
+          *inside the proposer subagent* before deciding. If after
+          discovery the data is in a protected-access tier (EGA /
+          dbGaP / IRB), set the data-acquisition candidate's
+          `human_only: true` and `description` MUST start with
+          "PROTECTED ACCESS — Lily must <DAC | provision | manual
+          download> before this dependency unblocks".
+       5. The dependency wiring is what makes this safe: the
+          downstream audit/training branch never runs until its
+          data-acquisition sibling lands `status=completed`, and
+          `pick-next` respects `depends_on`. This is the v0.1.7
+          version of "stop forcing autopilot to attempt experiments
+          on data that does not exist yet".
    - tell it: "Return ONLY a JSON object (not a bare array), schema:
      ```json
      {
        "skip_expansion": false,
        "candidates": [
-         {"kind": "approach|architecture|experiment|ablation|narrative|custom",
+         {"placeholder_id": "<short slug, used by sibling depends_on>",
+          "kind": "approach|architecture|experiment|ablation|narrative|custom|data",
           "task_type": "training|audit|analysis|data-acquisition|framing-decision|mixed",
           "human_only": false,
-          "depends_on": [],
+          "depends_on_placeholders": [],
           "title": "<≤80 chars>",
-          "description": "<2-4 sentences>"}
+          "description": "<2-4 sentences. For data-acquisition candidates: include source (CELLxGENE dataset UUID / GEO accession / figshare DOI) and expected n_cells.>"}
        ]
      }
      ```
+     The `placeholder_id` lets siblings declare dependencies on
+     each other before any real node IDs exist (see v0.1.7
+     auto-propose data-acquisition rule above). The orchestrator
+     maps placeholders → real IDs after each `add` call. If a
+     candidate has no dependencies, leave `depends_on_placeholders`
+     empty.
+
      OR, when no branching is justified (depth ≥1 only):
      ```json
      {
@@ -155,16 +206,34 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
      ```
      The next autopilot pick on this node will dispatch `execute` directly, not `expand` again. Skip to step 6.
    - If `skip_expansion: true` BUT parent depth == 0: ignore the skip (charter forbids it at root). Tell the user via stderr "WARN: proposer requested skip_expansion at depth 0 — overriding per charter §2". Treat as if proposer returned 0 candidates and re-prompt or error.
-   - Otherwise, for each candidate in `candidates[]`:
+   - Otherwise, walk `candidates[]` in TWO PASSES (v0.1.7) so that
+     `depends_on_placeholders` can be resolved to real node ids.
+     `tree_state.py add` already prints the new node id on stdout, so
+     no extra flag is needed:
      ```bash
-     # v0.1.6: pass task_type / depends_on / human_only to add command.
-     # Defaults (training / [] / false) are safe omissions for backward compat.
-     EXTRA=""
-     [ -n "<task_type>" ] && EXTRA="$EXTRA --task-type <task_type>"
-     [ -n "<depends_on_csv>" ] && EXTRA="$EXTRA --depends-on <depends_on_csv>"
-     [ "<human_only>" = "true" ] && EXTRA="$EXTRA --human-only"
-     python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<description>" $EXTRA
+     # Pass 1 — add every candidate WITHOUT --depends-on. Capture the
+     # real id printed by `add` and build a placeholder_id → real_id map.
+     declare -A PLACE2ID
+     for c in candidates[]; do
+       EXTRA=""
+       [ -n "<task_type>" ] && EXTRA="$EXTRA --task-type <task_type>"
+       [ "<human_only>" = "true" ] && EXTRA="$EXTRA --human-only"
+       NEW_ID=$(python3 "$TREE_STATE" add <parent_node_id> <kind> "<title>" \
+                  --description "<description>" $EXTRA)
+       PLACE2ID["<placeholder_id>"]="$NEW_ID"
+     done
+
+     # Pass 2 — for any candidate with non-empty depends_on_placeholders,
+     # translate each placeholder to its real id and patch the node via
+     # `set depends_on=<csv>` (parse_kv handles comma-separated lists):
+     for c in candidates[] where depends_on_placeholders != []; do
+       DEPS_CSV=$(join , for p in depends_on_placeholders: PLACE2ID[$p])
+       python3 "$TREE_STATE" set "${PLACE2ID[<placeholder_id>]}" depends_on="$DEPS_CSV"
+     done
      ```
+     Pass-2 patching uses `set` because `add` validates `depends_on`
+     against the existing tree at insertion time and would reject
+     forward references to siblings added later in pass 1.
 5. (Optional, only if `mcp__codex__codex` is available) Spawn a codex fresh-thread red-team: pass the file paths `/tmp/rt_parent.json` + `/tmp/rt_siblings.txt` + the new children's ids, ask "any of these mutually redundant or obviously dominated?". Apply via `set status=dead death_reason=...` before continuing. **Never use codex-reply — fresh thread only.**
 6. Log the action:
    ```bash
@@ -241,6 +310,25 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
      - "RESULT.md must include `METRIC=<float>` (set to n_cells downloaded), `KEY_FINDING` (one line: which atlas, how many cells, where it lives), `ARTIFACTS`. Charter table covers rules 0/1/7."
      - "PHYSICAL artifacts: `DATA_MANIFEST.json` with required keys (`atlas_id`, `source_url`, `local_path`, `checksum`, `n_cells`, `downloaded_at`) where the referenced `local_path` MUST exist on disk after the download finishes. Plus `requirements.txt` or the download script."
      - "NO model artifacts; data-acquisition is a pure infrastructure step."
+     - "**Use the ready-made templates** in `$RTE_REPO/examples/data-acquisition/` — they already produce the exact DATA_MANIFEST.json schema the validator expects and emit a working RESULT.md. Three scripts:
+       - `cellxgene_discover.py` — only needed if you know the paper / disease / tissue but not the CELLxGENE dataset UUID. Runs three subcommands: `search --query '<keywords>'`, `list-collection --collection-id <uuid>`, `inspect-dataset --dataset-id <uuid>`. All return JSON. No auth; goes through env proxy if set.
+       - `cellxgene_download.sh` — copy into branch dir, edit the 4 env defaults (DATASET_ID / ATLAS_ID / ATLAS_LABEL / PAPER_DOI), then run with `nohup`. Auto-counts n_cells from the .h5ad, writes RESULT.md + DATA_MANIFEST.json.
+       - `geo_figshare_download.sh` — for non-CELLxGENE sources (GEO ftp, figshare ndownloader, Zenodo, GitHub releases). Same nohup pattern. Auto-counts cells for .h5ad; for other formats (.rds / .tar.gz / .mtx.gz) the subagent must pass N_CELLS=<int> from the paper or supplementary."
+     - "**Proxy policy** (sc-bias project hard rule, mirrored in any project that sets PROXY): downloads go through `http://127.0.0.1:17891`. NEVER use port 17890 (that is Claude Code's own metered upstream — one accidental 15 GB pull burned a quota). The templates default to 17891 and log a loud WARN if 17890 is detected. For projects without 17891, override with `PROXY='' bash cellxgene_download.sh` for direct connect, or `PROXY=http://your-host:port ...` for a custom proxy."
+     - "**Background mandate** (same as the training/audit task types — see step 5 'CRITICAL — background execution mandate' above). A multi-GB download takes hours, easily survives a session close. Concretely:
+       ```bash
+       cd .research-tree/branches/<node_id>/
+       cp $RTE_REPO/examples/data-acquisition/cellxgene_download.sh .
+       $EDITOR cellxgene_download.sh   # set DATASET_ID etc.
+       nohup bash cellxgene_download.sh > executor.log 2>&1 &
+       BGPID=$!
+       cat > EXECUTOR.json <<JSON
+       {\"pid\": $BGPID, \"started_at\": \"$(date -Iseconds)\", \"command\": \"bash cellxgene_download.sh\", \"log_file\": \"executor.log\", \"expected_outputs\": [\"RESULT.md\", \"DATA_MANIFEST.json\"], \"timeout_hours\": 12}
+       JSON
+       ```
+       Then return to the orchestrator. `stale_running_handler.py` will pick up completion on the next autopilot cycle."
+     - "**Protected-access escalation**: if the dataset is EGA / dbGaP / IRB-restricted / cloud-storage-with-credentials, DO NOT brute-force download. Write `DEAD.md` with `death_reason=\"needs_human: protected-access data (<source>), requires <DAC application | account provisioning | $-cost>\"`. That surfaces to the human as a STUCK trigger, which is the contract for hand-off. Lily will provision credentials or download manually and restart the branch."
+     - "**No silent format conversion**. If the source provides .rds and the project expects .h5ad, that conversion is a SEPARATE branch (`task_type=analysis` with sceasy or anndata2ri). Data-acquisition's only job is: pull bytes off the network, verify they are what the upstream metadata claimed, and register them. Conversion is downstream."
 
      **For `task_type=framing-decision`**: the orchestrator should NEVER reach this step. If it does, log the bug and write DEAD.md with `death_reason='framing-decision is human-only; autopilot must not execute it (skip in pick-next by setting human_only=true)'`.
 
@@ -478,6 +566,53 @@ A single autopilot step does this:
        for each junction with ≥1 completed AND ≥1 dead child AND no junction_audit_id yet:
          invoke /research-tree audit <junction_id>
    (Audit itself spawns codex fresh thread — no main context bloat.)
+
+7.5. **Auto-pivot detection** (v0.1.7 — signal_detector):
+     SIGNAL_DETECTOR="$RTE_REPO/scripts/signal_detector.py"
+     [ -f "$SIGNAL_DETECTOR" ] || SIGNAL_DETECTOR="$SKILL_DIR/../../scripts/signal_detector.py"
+     python3 "$SIGNAL_DETECTOR" check-pivot --project-root "$(pwd)" --write-proposal > /tmp/rte_pivot_$$.json
+     PIVOT_EXIT=$?
+     if [ $PIVOT_EXIT -eq 10 ]; then
+       # signal_detector found ≥1 junction where all/most completed siblings
+       # came back NULL. It wrote .research-tree/AUTO_PIVOT_PROPOSAL.md
+       # listing the dead-signal junctions. Read the proposal:
+       PROPOSAL=".research-tree/AUTO_PIVOT_PROPOSAL.md"
+       cat "$PROPOSAL"
+       # For each dead-signal junction, spawn ONE expand cycle on that
+       # junction with a re-framing prompt (proposer gets the
+       # AUTO_PIVOT_PROPOSAL section as context and is told: "the existing
+       # sibling approaches all came back null on the metric this junction
+       # was meant to measure. Propose 2-4 RE-FRAMING candidates — same
+       # root question, different angle of attack. Use placeholder
+       # depends_on if a new approach needs a precursor data-acquisition
+       # node. Mark anything that changes paper headline / venue / claim
+       # wording as `task_type=framing-decision` + `human_only=true` so it
+       # surfaces to the human instead of being auto-executed.")
+       #
+       # IMPORTANT: do NOT re-spawn the dead siblings or attempt to "fix"
+       # the protocol that produced NULLs. The whole point of auto-pivot
+       # is to recognize "this APPROACH is dead at this question" and
+       # branch into a different framing.
+       for jid in $(python3 -c "import json,sys; d=json.load(open('/tmp/rte_pivot_$$.json')); print(' '.join(j['parent_id'] for j in d['pivot_junctions']))"); do
+         # Re-expand junction with re-framing intent. The expand subagent's
+         # parent-context input includes the AUTO_PIVOT_PROPOSAL.md, so
+         # the proposer knows it must offer pivot candidates not retries.
+         /research-tree expand "$jid"
+       done
+       # After expanding, rename the proposal so next check-pivot cycle
+       # does not re-trigger on the same junctions:
+       mv "$PROPOSAL" ".research-tree/AUTO_PIVOT_PROPOSAL.handled.md"
+       echo "$(date -Iseconds)  auto_pivot expanded junctions: $jid" >> .research-tree/progress.log
+     fi
+     rm -f /tmp/rte_pivot_$$.json
+
+     **In silent mode**: do NOT surface the pivot proposal to the user
+     unless one of the proposed re-framing candidates was tagged
+     `human_only=true` (those are the paper-headline / venue / claim
+     wording decisions only the human can make — see CLAUDE.md red
+     lines). When such a candidate appears, surface it via a STUCK
+     event (the silent-mode contract surfaces STUCK / DONE /
+     ROOT_FAILURE only).
 
 8. Every 5 invocations, force a self-audit reflection — write to .research-tree/reflections/<N>.md:
      "Am I picking the easiest branches because they're easy, or because they're the most

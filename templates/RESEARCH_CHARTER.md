@@ -247,3 +247,82 @@ pivot_criteria:
   OR (consecutive_failed_steps > 20)          # safety stop
   OR (kill_argument_audit consistently fatal) # idea is dead even before experiments
 ```
+
+## Data acquisition rules (v0.1.7)
+
+`task_type=data-acquisition` branches are pure infrastructure: pull
+bytes off the network, verify them, register them. The hard rules:
+
+- **Source provenance**: every downloaded file MUST have its
+  `source_url` (exact URL, not "GEO" or "figshare"), `paper_doi`, and
+  `checksum` (sha256) recorded in `DATA_MANIFEST.json`. A re-pull by
+  any future branch must be byte-for-byte verifiable.
+- **n_cells honesty**: `DATA_MANIFEST.json.n_cells` must be the actual
+  cell count in the downloaded file, not the count claimed in the
+  paper. For `.h5ad` the template auto-counts (anndata `.shape[0]`).
+  For other formats, the executor reads the count from the supplementary
+  table the paper provides, AND posts a TODO to verify after format
+  conversion. Lying inflates downstream signal-detector noise.
+- **Proxy policy** (project-overridable): the default templates use
+  `http://127.0.0.1:17891` for downloads. Set `PROXY=""` for direct
+  connect, or `PROXY=<your_proxy>` to override. **Never** use port
+  17890 in the sc-bias project — that's Claude Code's metered
+  upstream and one bad download cost 15 GB last time.
+- **Protected-access tier**: if the data is EGA / dbGaP / IRB /
+  cloud-credentialed, the branch writes `DEAD.md` with
+  `death_reason="needs_human: protected-access data (<source>),
+  requires <DAC application | account provisioning | $-cost>"`. Do
+  NOT attempt to brute-force download. Lily provisions, then
+  restarts the branch.
+- **No silent reprocessing**: data-acquisition NEVER converts file
+  formats (.rds → .h5ad), runs cell-filtering, runs annotation
+  transfer, or merges multiple files. Each of those is a separate
+  `task_type=analysis` branch that consumes the registered raw data
+  and produces a new artifact. Conflating acquisition with
+  preprocessing makes provenance unauditable.
+
+## Pivot trigger rules (v0.1.7 — programmatic auto-pivot)
+
+`scripts/signal_detector.py` runs after every autopilot step's audit
+cadence. It reads each completed branch's `audit_report.json`
+(task_type=audit) or `metrics.json` (task_type=training) or RESULT.md
+(fallback) and classifies the result as STRONG / WEAK / NULL.
+Aggregate verdicts trigger different behaviors:
+
+| Sibling aggregate | Trigger |
+|---|---|
+| `ALL_STRONG` | promote one winner; deepen the junction |
+| `MIXED_POSITIVE` | normal junction audit picks the winner |
+| `ALL_WEAK` | no auto-pivot; junction stays alive but flagged in synthesize |
+| `ALL_NULL` | **auto-pivot** — write `AUTO_PIVOT_PROPOSAL.md`, expand junction with re-framing candidates |
+| `MOSTLY_NULL` (≥2/3 NULL) | **auto-pivot** with WARN |
+
+Default thresholds (override per project in this section):
+
+```yaml
+signal_thresholds:
+  strong_min_effect: 0.10        # |effect| ≥ 0.10 with CI excluding 0 → STRONG
+  null_max_effect: 0.05          # |effect| < 0.05 → NULL regardless of CI
+  null_p_threshold: 0.5          # p_value ≥ 0.5 → NULL (only used when no CI)
+  min_siblings_for_aggregate: 2  # need ≥2 completed siblings to call a junction
+  auto_pivot_min_null_fraction: 0.67   # ≥2/3 NULL siblings → pivot fires
+```
+
+**RESULT.md convention for signal_detector**: branches should report
+their headline metric as `METRIC=<float>` (already required) and, when
+available, also `EFFECT_SIZE=<float>`, `CI_LOW=<float>`, `CI_HI=<float>`,
+and (optionally) `P_VALUE=<float>`. The detector prefers task-specific
+JSON artifacts (`audit_report.json.blindspot_signal`,
+`metrics.json.downstream_tasks[*]`) over RESULT.md scraping when those
+exist. Bootstrap-style reproducibility metrics where "high P = good"
+should NOT be reported as `P_VALUE` — leave that field blank and rely
+on the CI exclusion instead, since the detector interprets P_VALUE in
+the standard frequentist "failure-to-reject-null" sense.
+
+**Auto-pivot is not a retry**. When ALL siblings come back NULL, the
+detector treats the APPROACH as dead, not the experiment. The
+re-framing candidates the proposer is asked for must change the
+question, not the protocol — same root question, different angle of
+attack. If a re-framing candidate would change paper headline / venue /
+claim wording, the proposer tags it `task_type=framing-decision` +
+`human_only=true` and the autopilot surfaces it instead of executing.

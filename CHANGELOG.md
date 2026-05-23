@@ -2,6 +2,92 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.7] — 2026-05-23
+
+Two upgrades that close the autopilot's biggest remaining unattended-run
+gaps: (1) autopilot can now actually **pull external data** for itself
+(CELLxGENE Discover + GEO + figshare templates plus a discover helper),
+and (2) it programmatically detects "this approach is dead" via
+`signal_detector.py` and writes an auto-pivot proposal that re-frames the
+question instead of retrying the dead protocol. Together these address
+the sc-bias Stage 1 failure mode where a strong pilot signal led to
+wholesale buy-in and a paper-framing rewrite when cross-atlas validation
+came back null.
+
+### Added
+- `examples/data-acquisition/` — three copy-and-edit templates that
+  produce the exact `DATA_MANIFEST.json` schema
+  `charter_validator.py --task-type data-acquisition` requires:
+  - `cellxgene_discover.py` — search / list-collection / inspect-dataset
+    over CELLxGENE Discover via the curation API. Resolves the canonical
+    download URL from `assets[].url` (the `<dataset_id>.h5ad` pattern
+    is NOT reliable for re-versioned datasets).
+  - `cellxgene_download.sh` — accepts either `SOURCE_URL` directly or
+    `DATASET_ID + COLLECTION_ID` for auto-resolution; downloads via
+    configurable proxy (defaults to `127.0.0.1:17891`, sc-bias convention);
+    auto-counts `n_cells` from the resulting `.h5ad` via anndata (with
+    h5py fallback when the anndata NumPy ABI is broken); writes
+    `DATA_MANIFEST.json` + `RESULT.md` automatically.
+  - `geo_figshare_download.sh` — generic single-URL puller for GEO ftp,
+    figshare ndownloader, Zenodo records, GitHub releases. Supports
+    `POST_DOWNLOAD_CMD` for unpacking archives + `EXTRACTED_LOCAL_PATH`
+    so the manifest's `local_path` points to the validator-checkable
+    artifact.
+  - `README.md` with subagent recipes + proxy policy + protected-access
+    escalation contract.
+- `scripts/signal_detector.py` — classifies a completed branch as
+  STRONG / WEAK / NULL / UNKNOWN. Prefers
+  `audit_report.json.blindspot_signal` for `task_type=audit`,
+  `metrics.json.downstream_tasks` for `task_type=training`, falls back to
+  parsing `METRIC=`, `EFFECT_SIZE=`, `CI_LOW=`, `CI_HI=`, `P_VALUE=`
+  from RESULT.md. Aggregates sibling branches at a junction into
+  ALL_NULL / MOSTLY_NULL / MIXED_POSITIVE / ALL_STRONG / etc. and
+  exits 10 + writes `.research-tree/AUTO_PIVOT_PROPOSAL.md` when
+  auto-pivot fires. CI exclusion overrides p_value semantics so
+  bootstrap-style "high P = good" metrics do not mis-trigger NULL.
+- `tests/test_signal_detector.sh` — 12 cases covering Krishna STRONG /
+  Li2022 NULL / per-FM WEAK / CI crossing zero / tiny-effect override /
+  no-CI provisional / aggregate ALL_NULL → pivot proposal / idempotency
+  / MIXED_POSITIVE → no pivot.
+- `tests/test_data_acquisition.sh` — 8 cases covering discover CLI
+  surface, end-to-end download against local HTTP server, manifest
+  schema, validator PASS round-trip, validator FAIL on missing
+  checksum, 17890-proxy warning.
+
+### Changed
+- `skills/research-tree/SKILL.md`:
+  - Execute step's `task_type=data-acquisition` block now teaches the
+    subagent to use the new templates, the proxy policy (17891 not
+    17890), the nohup-then-return background pattern, and how to
+    surface protected-access blockers via `DEAD.md`.
+  - Expand step now requires the proposer to check local data
+    existence before naming a case-needing-atlas; if the atlas is
+    missing, the proposer auto-inserts a `task_type=data-acquisition`
+    sibling and wires `depends_on` via the placeholder-id pattern.
+  - Proposer JSON schema gains `placeholder_id` +
+    `depends_on_placeholders` so siblings can declare dependencies on
+    each other before any real node IDs exist; orchestrator resolves
+    placeholders → real IDs in a two-pass add.
+  - Autopilot gains step 7.5 (auto-pivot detection) that runs
+    `signal_detector.py check-pivot --write-proposal`, expands
+    dead-signal junctions with a re-framing prompt, and renames the
+    handled proposal to `AUTO_PIVOT_PROPOSAL.handled.md`.
+- `templates/RESEARCH_CHARTER.md` gains §"Data acquisition rules"
+  (provenance, n_cells honesty, proxy policy, protected-access,
+  no-silent-reprocessing) and §"Pivot trigger rules" (auto-pivot
+  trigger table, signal_thresholds yaml, RESULT.md convention,
+  pivot ≠ retry rule).
+
+### Notes for users on v0.1.6
+- Fully backward compatible. Tools added; existing schema unchanged.
+- The `cellxgene_download.sh` template requires `COLLECTION_ID` in
+  addition to `DATASET_ID` (or skip both and pass `SOURCE_URL`
+  directly) because the curation API's dataset endpoint is
+  collection-scoped — direct `/curation/v1/datasets/<id>` returns 404.
+- Real-world dogfood on a 12.2 GiB CELLxGENE Discover dataset (Perez
+  2022 SLE PBMC, 1.26M cells, collection 436154da-..., dataset
+  218acb0f-...) succeeded against the live 17891 proxy.
+
 ## [0.1.6] — 2026-05-23
 
 Task-type-aware nodes. The v0.1.3 validator was hard-coded for training new
