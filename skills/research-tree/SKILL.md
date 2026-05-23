@@ -11,6 +11,8 @@ You are running the `research-tree` skill. Your job is to drive a **tree-shaped 
 
 **You do not ask the user which technical fork to take.** You pick yourself based on expected value, run a small pilot, audit with codex, and decide. The user only sees the final report.
 
+**Hardline enforcement** (v0.1.3): the charter is NOT just a prompt — it is enforced by `scripts/charter_validator.py`, a separate program that runs after every branch and checks for the **physical files** (test_split.json with hash, ≥3 seed checkpoint dirs, metrics.json with param_count ≥10M and downstream task p-values, ≥4 ablation subdirs, requirements.txt). On top of that, every passing branch goes through a **fresh codex thread** for external adversarial audit before being marked `completed`. A subagent that fabricates RESULT.md text without the backing files gets marked dead by the validator, period. **Never skip steps 6b–6d in `execute`. Never re-spawn the subagent to "try again" after a validator FAIL — that defeats the purpose.**
+
 ## Locations and helpers
 
 The skill ships with two Python helpers. Resolve them via this chain (works regardless of how the skill was installed):
@@ -20,8 +22,10 @@ SKILL_DIR="${CLAUDE_SKILL_DIR:-$(dirname "$(realpath "$0" 2>/dev/null || echo .)
 RTE_REPO="${RESEARCH_TREE_REPO:-/data3/liying/research-tree-explorer}"
 TREE_STATE="$RTE_REPO/scripts/tree_state.py"
 SYNTHESIZE="$RTE_REPO/scripts/synthesize_report.py"
+VALIDATOR="$RTE_REPO/scripts/charter_validator.py"
 [ -f "$TREE_STATE" ] || TREE_STATE="$SKILL_DIR/../../scripts/tree_state.py"
 [ -f "$SYNTHESIZE" ] || SYNTHESIZE="$SKILL_DIR/../../scripts/synthesize_report.py"
+[ -f "$VALIDATOR" ] || VALIDATOR="$SKILL_DIR/../../scripts/charter_validator.py"
 ```
 
 If neither path exists, abort with a clear error pointing to https://github.com/lily/research-tree-explorer.
@@ -67,7 +71,7 @@ python3 "$TREE_STATE" init "$ROOT_IDEA" \
    ```
    Then tell the user: "I copied the default research charter to RESEARCH_CHARTER.md. **Read it and edit the venue/data/architecture/done-criteria fields to match your project before running autopilot.** Subagents will obey whatever's in there — bad charter = bad behavior."
 
-After init, print one paragraph to the user: "Tree initialized. Budgets: max depth 5, max 30 nodes total, max 48 GPU-hours. Charter at RESEARCH_CHARTER.md — edit it now if defaults don't fit. Run `/research-tree autopilot` to start exploring."
+After init, print one paragraph to the user: "Tree initialized. Budgets: max depth 5, max 30 nodes total, max 48 GPU-hours. Charter at RESEARCH_CHARTER.md — **edit it now** if defaults don't fit (venue, downstream tasks, baselines). Two enforcement layers are active: (1) `charter_validator.py` checks physical files on every branch (test_split.json hash, ≥3 seed checkpoints, ablations, metrics.json fields), (2) every passing branch goes through a fresh codex thread for external audit. Fabricated RESULT.md without backing files = branch auto-marked dead. Run `/research-tree autopilot` to start, or `/loop 30m /research-tree autopilot --silent` for continuous unattended runs."
 
 ### expand
 
@@ -113,24 +117,105 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
 
 1. Read the node: `python3 "$TREE_STATE" get <node_id>`
 2. Read the node's parent and any sibling completed nodes for context.
-3. Mark the node running: `python3 "$TREE_STATE" set <node_id> status=running`.
-4. Create the branch workdir if not present (the `add` step already does this): `.research-tree/branches/<node_id>/`.
+3. Mark the node running: `python3 "$TREE_STATE" running <node_id>`.
+4. Create the branch workdir if not present (the `add` step already does this): `.research-tree/branches/<node_id>/`. Then **scrub any stale audit artifacts that an earlier run may have left** so they cannot fool the validator:
+   ```bash
+   rm -f ".research-tree/branches/<node_id>/CODEX_AUDIT.json" ".research-tree/branches/<node_id>/AUDIT_NONCE" ".research-tree/branches/<node_id>/VALIDATION.json"
+   ```
 5. **Spawn an Agent** (subagent_type=general-purpose) with a self-contained prompt that:
    - States the branch's hypothesis (one paragraph)
    - States the budget (e.g., "2 hours wall time, 1 GPU max")
    - Says "work entirely inside `.research-tree/branches/<node_id>/`"
    - **Pastes RESEARCH_CHARTER.md in full and says: "Obey the charter. The final RESULT.md MUST end with the charter compliance audit table from §Charter compliance audit format. Any FAIL on a (strict) rule means you write DEAD.md instead of RESULT.md, with death_reason='charter_violation: <which rule>'. Honest failure beats fake success."**
-   - Says "write a `RESULT.md` at the end with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, then the charter compliance audit table"
+   - Says "write a `RESULT.md` at the end with: METRIC=<float>, KEY_FINDING=<paragraph>, COST=<gpu_hours>, ARTIFACTS=<list>, DONE_READY=<true|false>, then the charter compliance audit table"
+   - **Says: "You also MUST produce these PHYSICAL artifacts inside the branch_dir, because a programmatic validator will check for them after you return — text claims alone are not enough:**
+     - `data/test_split.json` — JSON with keys `test_ids`, `hash`, `created_at`
+     - `checkpoints/seed_0/`, `seed_1/`, `seed_2/` — each containing at least one `.pt`/`.pth`/`.safetensors`/`.ckpt` file
+     - `metrics.json` — must include `param_count` (int ≥ 10M), `seeds` (list of ≥3), `downstream_tasks` (dict where each task has `metric`, `std`, `baseline_score`, `p_value`), `gpu_hours_used`, `wall_clock_hours`
+     - `ablations/` — at least 4 subdirs (headline component, scale, data efficiency, cross-batch), each with a result file
+     - `requirements.txt` or `environment.yml`
+     - If you set `DONE_READY=true`: also `KILL_ARGUMENT.md` with a self-rejection memo + defense
+   - **Bluntly says: "Do NOT fabricate these files with fake content. A separate validator AND an external codex auditor will run after you, and both will catch lies. Faking files = branch marked dead with `death_reason='validator: <detail>'`."**
    - Says "if you hit a blocker that makes the hypothesis untestable, write a `DEAD.md` with the blocker description instead — that is a valid outcome"
    - **Anti-laziness reminder**: "Do NOT take shortcuts because the deadline is tight or the data is awkward. If the charter mandates full-data training and you can only finish in budget with a subset, write DEAD.md with reason 'needs full-scale compute, cannot honestly complete in pilot budget'. The user values honest failure over fake success. The dead-branch atlas is part of the deliverable."
-6. When the subagent returns:
-   - If `RESULT.md` exists: **parse it and the charter compliance table**.
-     - If any strict rule is FAIL: override to dead: `set status=dead death_reason="charter_violation: <rule>"`.
-     - Otherwise: `set status=completed score=<METRIC>`.
-     - **Additionally, parse `DONE_READY: true|false` from RESULT.md.** If `DONE_READY: true`, also `set <id> done_ready=true`. This signals to synthesize that the project is done and ARIS should be invoked. The subagent should only set `DONE_READY: true` if it self-attests: (a) all charter strict rules PASS, (b) the metric meets venue threshold from `RESEARCH_CHARTER.md → done_criteria`, (c) all required ablations done, (d) winner survives a /kill-argument style self-rejection memo.
-   - If `DEAD.md` exists: `python3 "$TREE_STATE" set <node_id> status=dead death_reason="<from DEAD.md>" death_evidence=".research-tree/branches/<node_id>/DEAD.md"`.
-   - If neither: `python3 "$TREE_STATE" set <node_id> status=dead death_reason="execution returned no verdict" death_evidence=<agent log path>`.
-7. After the subagent returns, do NOT continue working on that branch in your own context — your job is tree-level orchestration only.
+
+6. When the subagent returns, **do the hardline validation chain — do not skip steps**. Every status transition uses the dedicated `complete` / `die` commands; `set` cannot change status anymore (the state machine refuses it):
+   - **6a. Quick triage**:
+     - If `DEAD.md` exists: `python3 "$TREE_STATE" die <node_id> --reason "<first line of DEAD.md>" --evidence ".research-tree/branches/<node_id>/DEAD.md"`. Done — skip to step 7.
+     - If `RESULT.md` is missing: `python3 "$TREE_STATE" die <node_id> --reason "execution returned no RESULT.md and no DEAD.md"`. Done — skip to step 7.
+   - **6b. Programmatic charter validation pass 1** (always runs, never skipped):
+     ```bash
+     python3 "$VALIDATOR" ".research-tree/branches/<node_id>" > .research-tree/branches/<node_id>/VALIDATION.json 2> .research-tree/branches/<node_id>/VALIDATION.stderr
+     VALIDATOR_EXIT=$?
+     ```
+     If `VALIDATOR_EXIT != 0` (FAIL or WARN): read VALIDATION.json `failures[]`/`warnings[]`, take the first item, then `python3 "$TREE_STATE" die <node_id> --reason "validator: <first failure-or-warning>" --evidence ".research-tree/branches/<node_id>/VALIDATION.json"`. Done — skip to step 7. **Do not argue with the validator. Do not re-spawn the subagent to "try again". Both FAIL and WARN kill the branch — strict-by-default is the design.**
+   - **6c. External codex audit** (always runs when 6b returned PASS, fail-CLOSED if codex unavailable):
+     1. Generate a fresh challenge nonce and write it to disk. The orchestrator owns the nonce file; the subagent has never seen it:
+        ```bash
+        openssl rand -hex 32 > ".research-tree/branches/<node_id>/AUDIT_NONCE"
+        NONCE=$(cat ".research-tree/branches/<node_id>/AUDIT_NONCE")
+        ```
+     2. Invoke `mcp__codex__codex` in a FRESH thread (never codex-reply). The prompt MUST embed the nonce and demand that codex list every file it reads with its SHA256, so the validator can verify the audit was not pre-fabricated:
+        ```
+        You are an external adversarial auditor for a research branch. Your job is
+        to read the artifacts on disk and decide whether the branch genuinely meets
+        the project's research charter, or whether it appears to take shortcuts.
+
+        AUDIT NONCE (echo this back verbatim in your JSON, field `nonce`): <NONCE>
+
+        Charter: <abs path to project>/RESEARCH_CHARTER.md
+        Branch directory: <abs path to .research-tree/branches/<node_id>/>
+        Files you MUST read and SHA256 (use `sha256sum` or equivalent):
+          - RESULT.md                  (claims + charter compliance table)
+          - metrics.json               (numerical evidence)
+          - data/test_split.json       (held-out test hash)
+          - checkpoints/seed_*/*.{pt,pth,safetensors,ckpt}  (sample at least one)
+          - ablations/*/result.json    (sample at least one)
+          - VALIDATION.json            (programmatic validator's pass-1 findings)
+
+        Look for:
+        - fabricated numbers (metrics suspiciously round, std=0, identical across seeds)
+        - missing ablations dressed up as present (result.json is just `{}`)
+        - baselines not actually compared to SOTA
+        - param_count in metrics.json contradicts checkpoint file sizes
+        - downstream task results inconsistent across seeds
+        - KILL_ARGUMENT.md that doesn't actually defend (if DONE_READY=true)
+
+        Return ONLY a JSON object, no prose around it:
+        {
+          "nonce": "<the AUDIT NONCE above, verbatim>",
+          "verdict": "PASS" | "FAIL",
+          "reasoning_summary": "<one sentence>",
+          "reasoning": "<detailed 3-5 sentence justification>",
+          "specific_concerns": ["<concern 1>", "<concern 2>", ...],
+          "files_read": {
+            "RESULT.md": "<sha256>",
+            "metrics.json": "<sha256>",
+            "data/test_split.json": "<sha256>",
+            ...
+          }
+        }
+        ```
+        Write codex's response (extracting just the JSON object if codex wraps it in prose) to `.research-tree/branches/<node_id>/CODEX_AUDIT.json`.
+     3. **If the codex MCP server is unavailable, the call errors, or returns no JSON within timeout**: fail-CLOSED. Run `python3 "$TREE_STATE" die <node_id> --reason "external_audit_unavailable: codex MCP did not respond" --evidence ".research-tree/branches/<node_id>/"`. Never silently skip the audit. v0.1.3 treats codex MCP as a HARD dependency.
+   - **6d. Programmatic charter validation pass 2** (validates the codex audit, including nonce + SHA256 cross-checks):
+     ```bash
+     python3 "$VALIDATOR" ".research-tree/branches/<node_id>" --require-codex-audit --audit-nonce-file ".research-tree/branches/<node_id>/AUDIT_NONCE" > .research-tree/branches/<node_id>/VALIDATION.json 2> .research-tree/branches/<node_id>/VALIDATION.stderr
+     VALIDATOR_EXIT=$?
+     METRIC=$(grep -E '^METRIC[=:]' ".research-tree/branches/<node_id>/RESULT.md" | head -1 | sed -E 's/.*[=:]\s*//')
+     ```
+     - `VALIDATOR_EXIT != 0`: `die <node_id> --reason "codex audit / validation pass 2: <first failure>" --evidence ".../VALIDATION.json"`.
+     - `VALIDATOR_EXIT == 0`: mark completed via the proof-carrying command:
+       ```bash
+       DONE_READY_FLAG=""
+       if grep -qE '^DONE_READY[=:]\s*true' ".research-tree/branches/<node_id>/RESULT.md"; then
+         DONE_READY_FLAG="--done-ready"
+       fi
+       python3 "$TREE_STATE" complete <node_id> --validator-report ".research-tree/branches/<node_id>/VALIDATION.json" --score "$METRIC" $DONE_READY_FLAG
+       ```
+       `complete` re-reads the validator report, refuses to proceed if verdict ≠ PASS, and records the SHA256 of the report as completion_proof on the node. This means even if a subagent later swaps the validator report on disk, the proof becomes verifiably stale.
+
+7. After step 6, do NOT continue working on that branch in your own context. Do NOT re-spawn the subagent to "fix" validator failures. A FAIL or WARN is a dead branch — that's the design. The orchestrator moves on.
 
 ### audit
 
@@ -182,10 +267,11 @@ Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights t
 **Modes**:
 - default: chatty — every step returns a one-paragraph summary to the user
 - `autopilot --silent`: silent — no per-step summary; only surfaces to the user on
-  three events: (a) DONE (charter done_criteria satisfied + auto-handoff to ARIS),
-  (b) ROOT_FAILURE (all root branches dead, pivot to /idea-pipeline),
-  (c) STUCK (no new completed node in 20 steps OR budget exhausted). For long runs
-  (`/loop 30m autopilot --silent`) the user only sees these key milestones.
+  three events: (a) DONE (charter done_criteria satisfied — autopilot STOPS and
+  hands off to human for paper-writing; nothing auto-invoked), (b) ROOT_FAILURE
+  (all root branches dead, pivot to /idea-pipeline), (c) STUCK (no new completed
+  node in 20 steps OR budget exhausted). For long runs (`/loop 30m autopilot --silent`)
+  the user only sees these key milestones.
 
 A single autopilot step does this:
 
@@ -196,9 +282,10 @@ A single autopilot step does this:
        Tell the user (always, even in silent): every approach under root is dead.
        Show ROOT_FAILURE.md. Recommend pivot. STOP.
      if .research-tree/DONE.md exists:
-       Tell the user (always, even in silent): done_criteria satisfied.
-       Show DONE.md. AUTO-INVOKE /paper-writing with winner branch dir + atlas
-       (see step 12 below). STOP.
+       Tell the user (always, even in silent): done_criteria satisfied, autopilot
+       has stopped, branch passed programmatic validator AND external codex audit.
+       Show DONE.md (which contains the human-review checklist). Do NOT auto-invoke
+       any writing tool. STOP and wait for the human.
 
 3. Check budget:
      python3 "$TREE_STATE" budget-check
@@ -255,21 +342,15 @@ A single autopilot step does this:
      Surface ONLY if: DONE.md was written this step, ROOT_FAILURE.md was written,
      budget exhausted, OR no new completed node in 20 consecutive steps (STUCK).
 
-12. **Auto-handoff on DONE** (added v0.1.2):
+12. **Hand-off on DONE — manual review, no auto-writing** (v0.1.3):
    If synthesize wrote .research-tree/DONE.md this step:
-     - Read DONE.md to confirm criteria are met
-     - Read the winner node: python3 "$TREE_STATE" get <winner_id>
-     - Invoke Skill(ARIS /paper-writing) with this prompt:
-       "Draft a paper for venue=<charter venue> using the winning method at
-        .research-tree/branches/<winner_id>/. The dead-branch atlas in
-        .research-tree/FINAL_REPORT.md is supplementary material. The
-        charter compliance audit in branches/<winner_id>/RESULT.md confirms
-        all strict rules PASS. Charter at <project>/RESEARCH_CHARTER.md."
-     - When /paper-writing returns, surface to the user: "Tree converged. Winner at
-       .research-tree/branches/<winner_id>/, draft paper at paper/main.pdf,
-       charter compliance all green. Next: review the draft, then
-       ARIS /auto-review-loop for adversarial review before submission."
-   Then STOP. Do not loop in-prompt.
+     - Surface DONE.md to the user verbatim (it already contains the human-review
+       checklist: read RESULT.md, walk branch_dir, eyeball CODEX_AUDIT.json,
+       compare against dead-branch atlas, then decide whether to write the paper).
+     - Do NOT invoke any paper-writing tool. The user explicitly wants to write
+       the paper themselves after manual review of the model + algorithm.
+     - STOP. Autopilot will not resume until the human deletes DONE.md and
+       reopens exploration (`python3 .../tree_state.py set <winner_id> done_ready=false`).
 ```
 
 **Why single-step**: each autopilot invocation is a fresh orchestration turn. Subagents handle the heavy expand / execute / audit work in isolated contexts. The main context never accumulates more than one step's worth of state — it reads from disk (`tree.json`, `progress.log`) at the start, dispatches one action, writes back to disk, returns. This is the same pattern as GSD's `gsd-autonomous` and is the only way to truly run for days without context drift.

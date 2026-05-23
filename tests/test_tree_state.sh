@@ -27,12 +27,45 @@ echo "=== test: budget exceeded ==="
 python3 "$TS" add root approach "branch D"
 python3 "$TS" add root approach "branch E" 2>&1 | grep -q "max_branches_per_junction" && echo "  budget gate fired correctly"
 
-echo "=== test: set status + score ==="
-python3 "$TS" set "$ID1" status=completed score=0.8 > /dev/null
-python3 "$TS" set "$ID2" status=dead death_reason="bad approach" > /dev/null
+echo "=== test: set cannot change status (v0.1.3 lockdown) ==="
+if python3 "$TS" set "$ID1" status=completed 2>/dev/null; then
+    echo "FAIL: set status=completed should be refused in v0.1.3"
+    exit 1
+fi
+if python3 "$TS" set "$ID1" status=dead 2>/dev/null; then
+    echo "FAIL: set status=dead should be refused in v0.1.3"
+    exit 1
+fi
+echo "  set lockdown works"
+
+echo "=== test: complete requires PASSING validator report ==="
+# Create a FAIL validator report — complete should refuse
+echo '{"verdict": "FAIL", "failures": ["fake"]}' > "$TMP/bad_report.json"
+if python3 "$TS" complete "$ID1" --validator-report "$TMP/bad_report.json" --score 0.9 2>/dev/null; then
+    echo "FAIL: complete should refuse FAIL validator report"
+    exit 1
+fi
+# Create a PASS report — should accept
+echo '{"verdict": "PASS", "failures": [], "warnings": []}' > "$TMP/good_report.json"
+python3 "$TS" complete "$ID1" --validator-report "$TMP/good_report.json" --score 0.8 > /dev/null
+
+echo "=== test: die marks dead with reason ==="
+python3 "$TS" die "$ID2" --reason "bad approach" > /dev/null
+
 STATS=$(python3 "$TS" stats)
-echo "$STATS" | grep -q "completed   : 1" || { echo "FAIL: expected 1 completed"; exit 1; }
-echo "$STATS" | grep -q "dead        : 1" || { echo "FAIL: expected 1 dead"; exit 1; }
+echo "$STATS" | grep -q "completed   : 1" || { echo "FAIL: expected 1 completed"; echo "$STATS"; exit 1; }
+echo "$STATS" | grep -q "dead        : 1" || { echo "FAIL: expected 1 dead"; echo "$STATS"; exit 1; }
+
+echo "=== test: completion_proof recorded ==="
+NODE_JSON=$(python3 "$TS" get "$ID1")
+echo "$NODE_JSON" | python3 -c "
+import json, sys
+n = json.load(sys.stdin)
+assert n['completion_proof'] is not None, 'completion_proof missing'
+assert n['completion_proof']['validator_verdict'] == 'PASS', 'wrong verdict'
+assert 'validator_report_sha256' in n['completion_proof'], 'no sha256'
+print('  completion_proof recorded')
+"
 
 echo "=== test: deepen winner ==="
 SUB=$(python3 "$TS" add "$ID1" ablation "deeper variant")
@@ -66,7 +99,7 @@ if python3 "$TS" add root approach "D" 2>/dev/null; then
     exit 1
 fi
 # Kill A, then 4th must succeed (2 alive + 1 dead = 1 slot free)
-python3 "$TS" set 1 status=dead death_reason="testing" > /dev/null
+python3 "$TS" die 1 --reason "testing" > /dev/null
 NEW_ID=$(python3 "$TS" add root approach "D")
 test "$NEW_ID" = "4" || { echo "FAIL: expected id 4, got $NEW_ID"; exit 1; }
 echo "  dead-slot reuse works"
@@ -84,6 +117,43 @@ grep -q "action=init" .research-tree/progress.log || { echo "FAIL: progress.log 
 echo "  init scaffolding is complete"
 cd "$TMP"
 rm -rf "$TMP3"
+
+echo "=== test: concurrent adds get unique IDs (flock) ==="
+TMP4=$(mktemp -d)
+cd "$TMP4"
+python3 "$TS" init "race" --max-branches 20 --max-total-nodes 50 > /dev/null
+# 10 parallel adds with flock should each get a unique ID, no duplicates
+seq 1 10 | xargs -P 10 -I {} python3 "$TS" add root approach "b{}" > /tmp/rte_concurrent_ids 2>/dev/null
+UNIQUE=$(sort -u /tmp/rte_concurrent_ids | wc -l)
+TOTAL=$(wc -l < /tmp/rte_concurrent_ids)
+if [ "$UNIQUE" != "10" ] || [ "$TOTAL" != "10" ]; then
+    echo "FAIL: concurrent add produced $TOTAL ids, $UNIQUE unique (expected 10/10)"
+    cat /tmp/rte_concurrent_ids
+    exit 1
+fi
+echo "  flock prevents duplicate IDs under parallel writes"
+cd "$TMP"
+rm -rf "$TMP4"
+
+echo "=== test: reopen clears completion_proof ==="
+TMP5=$(mktemp -d)
+cd "$TMP5"
+python3 "$TS" init "reopen-test" > /dev/null
+NID=$(python3 "$TS" add root approach "x")
+echo '{"verdict": "PASS"}' > /tmp/rte_pass.json
+python3 "$TS" complete "$NID" --validator-report /tmp/rte_pass.json --score 0.7 > /dev/null
+python3 "$TS" reopen "$NID" > /dev/null
+NODE=$(python3 "$TS" get "$NID")
+echo "$NODE" | python3 -c "
+import json, sys
+n = json.load(sys.stdin)
+assert n['status'] == 'pending', f'expected pending, got {n[\"status\"]}'
+assert n['completion_proof'] is None, 'completion_proof should be cleared'
+assert n['score'] is None, 'score should be cleared'
+print('  reopen clears completion_proof and score')
+"
+cd "$TMP"
+rm -rf "$TMP5"
 
 echo
 echo "PASS — all tree_state.py smoke tests green."

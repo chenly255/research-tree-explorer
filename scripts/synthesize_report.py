@@ -157,32 +157,51 @@ def main() -> None:
     root_children = [nodes[c] for c in root_node["children"]]
     all_root_dead = bool(root_children) and all(c["status"] == "dead" for c in root_children)
 
-    # DONE detection: any completed node has done_ready=true (set by the
-    # branch's subagent after self-attesting charter compliance + threshold met).
+    # DONE detection: requires (a) status=completed, (b) done_ready=true,
+    # (c) completion_proof recorded (proves status was set via the validator
+    # chain, not a raw `set status=completed` bypass).
     done_winner = next(
-        (n for n in completed if n.get("done_ready") is True),
+        (n for n in completed
+         if n.get("done_ready") is True and n.get("completion_proof") is not None),
         None,
     )
     if done_winner is not None:
         done_path = root / STATE_DIR_NAME / "DONE.md"
         done_lines = [
-            "# Project DONE",
+            "# Project DONE — awaiting human review",
             "",
             f"Winner: **`{done_winner['id']}` — {done_winner['title']}**",
             f"Score: {done_winner['score']:.4f} on primary metric",
             f"Branch dir: `{done_winner.get('branch_dir', 'N/A')}/`",
             "",
-            "## Why this is DONE",
+            "## Why autopilot stopped here",
             "",
-            f"The branch's subagent self-attested `done_ready=true` after verifying "
-            f"charter compliance and threshold criteria. See "
-            f"`{done_winner.get('branch_dir', 'branches/<id>')}/RESULT.md` for the "
-            f"charter compliance audit table.",
+            f"The branch's subagent self-attested `done_ready=true` AND the programmatic "
+            f"charter validator confirmed all strict rules PASS AND the external codex "
+            f"audit returned verdict=PASS. See:",
             "",
-            "## Next action",
+            f"- `{done_winner.get('branch_dir', 'branches/<id>')}/RESULT.md` — full result + charter table",
+            f"- `{done_winner.get('branch_dir', 'branches/<id>')}/CODEX_AUDIT.json` — external auditor verdict",
+            f"- `{done_winner.get('branch_dir', 'branches/<id>')}/KILL_ARGUMENT.md` — self-rejection memo + defense",
             "",
-            "autopilot will auto-invoke ARIS /paper-writing on the winner artifacts "
-            "and the dead-branch atlas in FINAL_REPORT.md.",
+            "## Hand-off to human (you)",
+            "",
+            "Autopilot does NOT auto-write the paper. Recommended manual review:",
+            "",
+            "1. Read RESULT.md end-to-end — sanity-check the numbers and the audit table.",
+            "2. Walk the branch_dir — open metrics.json, eyeball checkpoints/ and ablations/.",
+            "3. Look at CODEX_AUDIT.json — what did the external reviewer flag, even if PASS?",
+            "4. Compare against the dead-branch atlas in FINAL_REPORT.md — does the winner",
+            "   genuinely dominate the losers, or did it just survive longest?",
+            "5. If satisfied, you (the human) decide whether to write the paper, run more",
+            "   ablations, or pivot. Autopilot will not act further until you re-enable it.",
+            "",
+            "## Re-open exploration",
+            "",
+            "```",
+            "rm .research-tree/DONE.md",
+            f"python3 .../tree_state.py set {done_winner['id']} done_ready=false",
+            "```",
         ]
         done_path.write_text("\n".join(done_lines) + "\n")
         print(f"OK: also wrote DONE.md to {done_path}")
@@ -192,14 +211,15 @@ def main() -> None:
 
     if done_winner is not None:
         lines.append(
-            f"**DONE — AUTO-HANDOFF TO ARIS.** Winner `{done_winner['id']}` "
-            f"({done_winner['title']}) self-attested charter compliance + threshold "
-            f"met. autopilot will invoke `/paper-writing` automatically on next step "
-            f"with the winner artifacts at `{done_winner.get('branch_dir', 'N/A')}/` "
-            f"plus the dead-branch atlas as supplementary material."
+            f"**DONE — HUMAN REVIEW REQUIRED.** Winner `{done_winner['id']}` "
+            f"({done_winner['title']}) passed self-attestation, programmatic charter "
+            f"validation, and external codex audit. Autopilot has stopped. "
+            f"Artifacts at `{done_winner.get('branch_dir', 'N/A')}/`. "
+            f"See `.research-tree/DONE.md` for the human-review checklist. "
+            f"Autopilot will NOT auto-write a paper — that decision is yours."
         )
         lines.append("")
-        lines.append("If you want to override (e.g., reopen exploration), run:")
+        lines.append("To reopen exploration:")
         lines.append("")
         lines.append("```")
         lines.append("rm .research-tree/DONE.md")
@@ -257,19 +277,13 @@ def main() -> None:
         lines.append("")
         paper_strength = "looks strong" if threshold_strong else "may not be strong enough yet"
         lines.append(
-            f"**(c) Transition to paper writing** — the winner {paper_strength}. Hand off to "
-            f"ARIS:"
+            f"**(c) Hand off to human for paper writing** — the winner {paper_strength}. "
+            f"Autopilot will not auto-write the paper. To finish, the human should:"
         )
         lines.append("")
-        lines.append("```")
-        lines.append(f"/paper-writing \"draft a paper around the winner at {winner_dir}, "
-                     f"using the dead-branch atlas in .research-tree/FINAL_REPORT.md as "
-                     f"supplementary material\"")
-        lines.append("```")
-        lines.append("")
-        lines.append(
-            "Or `/auto-review-loop` first if you want adversarial review before drafting."
-        )
+        lines.append(f"- Walk the winner artifacts at `{winner_dir}/`")
+        lines.append("- Read RESULT.md charter compliance table + CODEX_AUDIT.json")
+        lines.append("- Write the paper manually (or invoke their preferred writing tool)")
     elif alive:
         lines.append(
             f"All branches either pending or in progress ({len(alive)} alive). Resume by "
