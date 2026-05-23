@@ -135,6 +135,59 @@ echo "  flock prevents duplicate IDs under parallel writes"
 cd "$TMP"
 rm -rf "$TMP4"
 
+echo "=== test: direct_executable field (v0.1.5) ==="
+TMP_DE=$(mktemp -d)
+cd "$TMP_DE"
+python3 "$TS" init "direct exec test" > /dev/null
+ND=$(python3 "$TS" add root approach "canonical")
+# default should be false
+DEFAULT_DE=$(python3 "$TS" get "$ND" | python3 -c "import json,sys; print(json.load(sys.stdin)['direct_executable'])")
+test "$DEFAULT_DE" = "False" || { echo "FAIL: default direct_executable should be False, got $DEFAULT_DE"; exit 1; }
+# set it via set command
+python3 "$TS" set "$ND" direct_executable=true > /dev/null
+NEW_DE=$(python3 "$TS" get "$ND" | python3 -c "import json,sys; print(json.load(sys.stdin)['direct_executable'])")
+test "$NEW_DE" = "True" || { echo "FAIL: set direct_executable=true didn't stick"; exit 1; }
+echo "  direct_executable defaults False, set=true works"
+cd "$TMP"
+rm -rf "$TMP_DE"
+
+echo "=== test: session-step counter (v0.1.5) ==="
+TMP_SS=$(mktemp -d)
+cd "$TMP_SS"
+python3 "$TS" init "session test" > /dev/null
+# First increment: count=1
+RC1=$(python3 "$TS" session-step increment --threshold 3 | python3 -c "import json,sys; print(json.load(sys.stdin)['count'])")
+test "$RC1" = "1" || { echo "FAIL: first increment should be 1, got $RC1"; exit 1; }
+# Second
+RC2=$(python3 "$TS" session-step increment --threshold 3 | python3 -c "import json,sys; print(json.load(sys.stdin)['count'])")
+test "$RC2" = "2" || { echo "FAIL: second should be 2, got $RC2"; exit 1; }
+# Third hits threshold — should exit non-zero
+set +e
+python3 "$TS" session-step increment --threshold 3 > /tmp/rte_ss.json
+SS_EXIT=$?
+set -e
+test "$SS_EXIT" = "1" || { echo "FAIL: at threshold should exit 1, got $SS_EXIT"; exit 1; }
+SHOULD_PAUSE=$(python3 -c "import json; print(json.load(open('/tmp/rte_ss.json'))['should_pause'])")
+test "$SHOULD_PAUSE" = "True" || { echo "FAIL: should_pause should be True"; exit 1; }
+echo "  session-step: count and threshold work, exit=1 when should_pause"
+
+# Report mode doesn't increment (still at threshold, so exit 1 expected — wrap)
+set +e
+python3 "$TS" session-step report --threshold 3 > /tmp/rte_ss.json
+set -e
+REPORT_COUNT=$(python3 -c "import json; print(json.load(open('/tmp/rte_ss.json'))['count'])")
+test "$REPORT_COUNT" = "3" || { echo "FAIL: report mode should not increment, expected 3 got $REPORT_COUNT"; exit 1; }
+echo "  report mode is non-mutating"
+
+# Reset wipes counter
+python3 "$TS" session-step reset > /dev/null
+python3 "$TS" session-step report > /tmp/rte_ss.json
+RESET_COUNT=$(python3 -c "import json; print(json.load(open('/tmp/rte_ss.json'))['count'])")
+test "$RESET_COUNT" = "0" || { echo "FAIL: after reset count should be 0, got $RESET_COUNT"; exit 1; }
+echo "  reset clears counter"
+cd "$TMP"
+rm -rf "$TMP_SS"
+
 echo "=== test: reopen clears completion_proof ==="
 TMP5=$(mktemp -d)
 cd "$TMP5"

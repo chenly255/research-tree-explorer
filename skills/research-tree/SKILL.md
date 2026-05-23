@@ -91,21 +91,50 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
    - depth 3: branch on **narrative angle** (which claim to lead with)
    - depth 4: branch on **ablations to lock in the story**
 3. **Spawn an Agent (subagent_type=general-purpose) — the branch-proposer.** Hand it a self-contained prompt:
-   - paste the parent node JSON (small)
+   - paste the parent node JSON (small) — **note the `depth` field, it changes the rules below**
    - paste the sibling list (small)
    - paste RESEARCH_BRIEF.md if it exists
    - **paste RESEARCH_CHARTER.md (mandatory if file exists) — proposer must propose candidates that COULD satisfy the charter; e.g., if charter §2 demands diversity at depth 0 across 4 architecture families, the proposer must include all 4 even if it thinks 3 would suffice**
    - state the kind of branching expected (from step 2)
-   - tell it: "Propose 2-4 candidate sub-branches. Each must be mutually distinct from the others and from existing siblings (no two flavors of the same idea). Aim for diversity in expected outcome: one safe, one ambitious, one weird. You may use Tavily to scan recent literature if it helps you tell mutually distinct from redundant — but cap the search at 2 queries. **If the charter mandates specific candidate families at this depth, include ALL of them — do not skip a mandated family to save tokens.**"
-   - tell it: "Return ONLY a JSON array. No prose. Schema:
+   - tell it the **branching rules by depth** (v0.1.5):
+     - **depth 0 (root)**: MUST propose 2-4 candidates per charter §2 diversity rule. Cannot skip. Cannot return 1.
+     - **depth ≥1**: Propose **1-4 candidates, OR signal that this node should be executed directly without sub-branching**. Choose based on honest research judgment:
+       - 2-4 candidates: there are genuinely distinct ways to do this step that should compete
+       - 1 candidate: there's an obvious next step, but it's worth keeping the option open to extend later
+       - **skip expansion**: this is the canonical/standard way to do this — branching is just busywork. Examples: "evaluate the trained model on the held-out test set" (no fork, you just do it), "compute the standard ARI metric" (no fork, this IS the method), "run the next obvious ablation that the charter requires"
+     - Decide as a human researcher would. Strongly prefer skipping expansion over forcing 3 fake-different "candidates" that are all the same thing.
+   - tell it: "Return ONLY a JSON object (not a bare array), schema:
      ```json
-     [{"kind": "approach|architecture|experiment|ablation|narrative|custom", "title": "<≤80 chars>", "description": "<2-4 sentences explaining the rationale and what 'success' would look like for this branch>"}]
-     ```"
+     {
+       "skip_expansion": false,
+       "candidates": [
+         {"kind": "approach|architecture|experiment|ablation|narrative|custom",
+          "title": "<≤80 chars>",
+          "description": "<2-4 sentences>"}
+       ]
+     }
+     ```
+     OR, when no branching is justified (depth ≥1 only):
+     ```json
+     {
+       "skip_expansion": true,
+       "skip_reason": "<one sentence on why no fork is needed — e.g., 'this is the canonical evaluation step, no design choice exists'>"
+     }
+     ```
+     "
    - tell it: "Report cap: just the JSON. Anything else wastes the orchestrator's context."
-4. Parse the returned JSON. For each candidate, run:
-   ```bash
-   python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<description>"
-   ```
+4. Parse the returned JSON.
+   - If `skip_expansion: true` AND parent depth ≥ 1: **do NOT create sub-nodes**. Instead, mark the current node as direct-executable:
+     ```bash
+     python3 "$TREE_STATE" set <node_id> direct_executable=true
+     echo "$(date -Iseconds)  skip_expansion node=<node_id> reason=\"<skip_reason>\"" >> .research-tree/progress.log
+     ```
+     The next autopilot pick on this node will dispatch `execute` directly, not `expand` again. Skip to step 6.
+   - If `skip_expansion: true` BUT parent depth == 0: ignore the skip (charter forbids it at root). Tell the user via stderr "WARN: proposer requested skip_expansion at depth 0 — overriding per charter §2". Treat as if proposer returned 0 candidates and re-prompt or error.
+   - Otherwise, for each candidate in `candidates[]`:
+     ```bash
+     python3 "$TREE_STATE" add <node_id> <kind> "<title>" --description "<description>"
+     ```
 5. (Optional, only if `mcp__codex__codex` is available) Spawn a codex fresh-thread red-team: pass the file paths `/tmp/rt_parent.json` + `/tmp/rt_siblings.txt` + the new children's ids, ask "any of these mutually redundant or obviously dominated?". Apply via `set status=dead death_reason=...` before continuing. **Never use codex-reply — fresh thread only.**
 6. Log the action:
    ```bash
@@ -305,13 +334,26 @@ Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights t
 **`autopilot` is a single-step command, not a long-running loop.** Each invocation does ONE unit of work and returns. To run continuously, the user wraps it with the external `/loop` skill, e.g. `/loop 30m /research-tree autopilot`. This keeps your main context fresh — each step is one orchestration turn, heavy work is in subagents, no in-prompt for-loops that bloat over time.
 
 **Modes**:
-- default: chatty — every step returns a one-paragraph summary to the user
-- `autopilot --silent`: silent — no per-step summary; only surfaces to the user on
+- default: chatty single-step — every step returns a one-paragraph summary to the user
+- `autopilot --silent`: silent single-step — no per-step summary; only surfaces to the user on
   three events: (a) DONE (charter done_criteria satisfied — autopilot STOPS and
   hands off to human for paper-writing; nothing auto-invoked), (b) ROOT_FAILURE
   (all root branches dead, pivot to /idea-pipeline), (c) STUCK (no new completed
   node in 20 steps OR budget exhausted). For long runs (`/loop 30m autopilot --silent`)
   the user only sees these key milestones.
+- `autopilot --continuous [--silent]` (v0.1.5): chained — keep doing steps as long
+  as there is non-blocking work (pending leaves OR ready_for_validation nodes
+  from finished background processes). Stop when:
+  - all live nodes are `running` (waiting on background nohup) → can't do anything until they finish
+  - DONE / ROOT_FAILURE detected → terminal
+  - session step counter hits threshold (default 20) → ask user to restart session for clean context
+  - budget exhausted
+  - same step counter ceiling acts as the STUCK guard
+  Use `--continuous` when you want autopilot to chew through quick chained work
+  (expand → audit → light analysis) without `/loop`'s 30-min sleep penalty.
+  Combine with `/loop 30m /research-tree autopilot --continuous --silent` for
+  best of both: continuous when there's quick work, /loop wakes up to handle
+  long-running training results when they land.
 
 A single autopilot step does this:
 
@@ -365,14 +407,16 @@ A single autopilot step does this:
      node_json=$(python3 "$TREE_STATE" get "$next_id")
    Parse "status" from JSON.
 
-6. Dispatch ONE action based on status:
-     - pending (never touched)        → invoke /research-tree expand "$next_id"
-     - expanded (has children)        → invoke /research-tree execute on its first pending grandchild
-                                       (this normally won't happen; pick-next prefers pending leaves)
-     - any other unexpected state     → log and stop
+6. Dispatch ONE action based on status AND direct_executable flag (v0.1.5):
+     - pending + direct_executable=true  → invoke /research-tree execute "$next_id"  (skip expand, this node is canonical)
+     - pending + direct_executable=false → invoke /research-tree expand "$next_id"   (try to fork)
+     - expanded (has children)           → invoke /research-tree execute on its first pending grandchild
+                                          (this normally won't happen; pick-next prefers pending leaves)
+     - any other unexpected state        → log and stop
 
-   Each of these subcommands does its own subagent dispatch internally. autopilot
-   does NOT run multiple subagents in one step. One step = one orchestrated action.
+   Each of these subcommands does its own subagent dispatch internally. In default
+   (single-step) mode autopilot does NOT run multiple subagents in one step.
+   See `--continuous` mode below for the chained variant.
 
 7. Every 3 invocations, check for junctions needing audit:
      loop_count=$(wc -l < .research-tree/progress.log)
@@ -403,6 +447,41 @@ A single autopilot step does this:
    - **--silent mode**: do NOT report per-step. Just write to progress.log and stop.
      Surface ONLY if: DONE.md was written this step, ROOT_FAILURE.md was written,
      budget exhausted, OR no new completed node in 20 consecutive steps (STUCK).
+
+11.5. **Session counter check** (v0.1.5 — context safety):
+     ```bash
+     python3 "$TREE_STATE" session-step increment --threshold 20 > /tmp/rte_session_$$.json
+     SESSION_EXIT=$?
+     ```
+     If `SESSION_EXIT != 0` (i.e., `should_pause: true`), the session has accumulated
+     enough steps that the main Claude Code context is getting heavy. Stop and tell
+     the user verbatim (always, even in --silent mode):
+     ```
+     Session context approaching capacity (20+ autopilot steps in this session).
+     Please restart Claude Code to clear context, then run /research-tree resume
+     to continue. State is durable in .research-tree/tree.json — no progress lost.
+     ```
+     If `--continuous` mode is set, this is the only graceful exit for a productive run
+     (other exits are terminal: DONE / ROOT_FAILURE / budget / STUCK).
+
+11.6. **Continuous loop** (only when `--continuous` flag is set):
+     After step 11.5, decide whether to immediately do another step:
+     ```
+     NEXT_ID=$(python3 "$TREE_STATE" pick-next)
+     # Also re-run stale handler to pick up any background processes that just finished
+     STALE_OUTPUT=$(python3 "$STALE_HANDLER" --project-root "$(pwd)")
+     READY_FOR_VAL=$(echo "$STALE_OUTPUT" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['ready_for_validation']))")
+     ```
+     Continue (loop back to step 1) if ANY of:
+     - `NEXT_ID != "NONE"` (there's a pending leaf to work on)
+     - `READY_FOR_VAL > 0` (a background process just finished, run validation)
+     - AND not should_pause, not DONE.md, not ROOT_FAILURE.md, not budget exhausted
+
+     Stop if ALL live nodes are `running` (everything is waiting on background work).
+     This is the "blocked, can't make progress without waiting" state — `/loop` will
+     wake autopilot back up later when background work has had time to finish.
+
+     In single-step mode (without --continuous), just stop after step 11.5 regardless.
 
 12. **Hand-off on DONE — manual review, no auto-writing** (v0.1.3):
    If synthesize wrote .research-tree/DONE.md this step:

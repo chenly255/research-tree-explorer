@@ -10,6 +10,8 @@ You hit `/research-tree init "<your idea>"`, walk away, and come back to `FINAL_
 
 **v0.1.4 — survives session restart**: long-running training is launched with `nohup` and registered in `EXECUTOR.json` (PID + log path). Closing the IDE no longer kills the work. When you reopen and run `/research-tree resume`, the new `stale_running_handler.py` scans every `status=running` node, checks PID liveness, and routes finished work through the validation chain — so cross-session recovery is automatic.
 
+**v0.1.5 — smart branching cadence**: the proposer no longer forces 2-4 fake-different candidates at every node — at depth ≥1 it can return `skip_expansion: true` for canonical steps (no design choice → execute directly). `autopilot --continuous` chains steps back-to-back without `/loop`'s 30-min sleep until every live node is blocked on background work or the session step counter (default 20) hits its threshold, at which point you're told to restart Claude Code for a clean context. Best of both: `/loop 30m /research-tree autopilot --continuous --silent` chews through quick chained work between `/loop` ticks but never accumulates more than ~20 steps of context per session.
+
 ---
 
 ## What this is, in one diagram

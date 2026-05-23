@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.5] — 2026-05-23
+
+Smarter branching cadence: stop forcing 2-4 candidates at every node, let the
+proposer skip expansion when there's nothing to fork on; replace the fixed-
+interval `/loop` rhythm with `--continuous` chained steps that pause only
+when blocked or when the session context counter says it's time to restart.
+
+### Added
+- `direct_executable` node field (default `false`). When the branch-proposer
+  signals `skip_expansion: true` (no real fork at this depth), the orchestrator
+  marks the node `direct_executable=true` instead of creating children. Next
+  autopilot pick on that node dispatches `execute` directly, skipping a
+  wasted expand round.
+- `tree_state.py session-step <report|increment|reset>` — tracks autopilot
+  steps within a single Claude Code session and reports `should_pause=true`
+  when the count crosses `--threshold` (default 20). Session identity is
+  determined by **ancestor PID chain intersection** (robust against bash
+  `$(...)` transient subshells; the long-lived Claude Code main process
+  appears in every chain).
+- `autopilot --continuous` mode (chained): runs steps back-to-back until
+  every live node is blocked on a background process, hits DONE/ROOT_FAILURE,
+  hits the budget, or hits the session step threshold. Removes the
+  fixed-30-min lag between quick chained steps. Combine with `/loop` for
+  long-running training: `/loop 30m /research-tree autopilot --continuous --silent`.
+
+### Changed
+- `expand` branch-proposer prompt rewritten:
+  - **depth 0**: still mandates 2-4 candidates spanning charter §2 families
+    (research diversity for NBT/NMI submission is non-negotiable).
+  - **depth ≥1**: accepts 1-4 candidates, OR `skip_expansion: true` when the
+    node represents a canonical/standard step with no genuine design choice.
+    "Run the standard evaluation" or "compute the required ARI metric" is now
+    a valid no-fork. Strongly prefers skipping over fabricating fake-different
+    candidates.
+- Return schema upgraded from bare JSON array to `{skip_expansion, candidates|skip_reason}`
+  object so the proposer can declare intent unambiguously.
+- `autopilot` step 6 dispatch table now considers `direct_executable`:
+  `pending + direct_executable=true → execute` instead of `expand`.
+- New step 11.5 (session counter) and 11.6 (continuous loop) added to the
+  autopilot script. Single-step mode (default) and `--silent` are unchanged
+  in behavior; `--continuous` is opt-in.
+- `SET_ALLOWED_KEYS` extended to include `direct_executable` so the proposer
+  hook can update it via `set` without going through a privileged transition.
+
 ## [0.1.4] — 2026-05-23
 
 Cross-session-restart survival. Previous versions ran branch experiments in

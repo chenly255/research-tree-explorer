@@ -57,7 +57,13 @@ VALID_KINDS = {"root", "approach", "architecture", "experiment", "ablation", "na
 SET_ALLOWED_KEYS = {
     "description", "score", "death_reason", "death_evidence",
     "done_ready", "completion_proof", "junction_audit_id", "branch_dir",
+    "direct_executable",
 }
+
+# Session step counter — autopilot reports `should_pause: true` when this many
+# steps have accumulated within a single Claude Code session, so the user can
+# restart for a clean context. Default tuned to ~30-40% of typical context window.
+DEFAULT_SESSION_STEP_THRESHOLD = 20
 
 
 def state_path(root: Path) -> Path:
@@ -240,6 +246,7 @@ def cmd_add(args) -> None:
             "junction_audit_id": None,
             "branch_dir": f"{STATE_DIR_NAME}/branches/{new_id}",
             "children": [],
+            "direct_executable": False,
             "created_at": now_iso(),
         }
         state["nodes"][new_id] = new_node
@@ -547,6 +554,111 @@ def cmd_audit_add(args) -> None:
     print(audit_id)
 
 
+def get_ancestor_pids() -> list[int]:
+    """Walk up the process tree via /proc, returning the chain of ancestor PIDs
+    from self up to (but not including) PID 1.
+
+    Used by session-step to detect 'same Claude Code session'. Bash `$(...)`
+    command substitution spawns a transient subshell, so getppid() varies between
+    consecutive calls — but the long-lived Claude Code main process appears in
+    every call's ancestor chain. Set intersection of ancestor lists between
+    successive invocations is a reliable 'same-session' predicate.
+    """
+    pids: list[int] = []
+    pid = os.getpid()
+    seen: set[int] = {pid}
+    while pid > 1:
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                ppid: int | None = None
+                for line in f:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            if ppid is None or ppid <= 1 or ppid in seen:
+                break
+            pids.append(ppid)
+            seen.add(ppid)
+            pid = ppid
+        except (OSError, ValueError):
+            break
+    return pids
+
+
+def cmd_session_step(args) -> None:
+    """Track how many autopilot steps have run within the current Claude Code
+    session. Detects 'same session' by ancestor-PID-chain intersection (robust
+    against transient subshell PIDs from bash `$()` substitution). When count
+    exceeds `--threshold`, reports `should_pause=true` so autopilot stops and
+    asks the user to restart the session for a clean context window.
+
+    Stored in `.research-tree/session_step.json`:
+        {
+          "ancestor_pids": [<pid>, ...],   # process tree up at first call
+          "count": <int>,
+          "started_at": <iso>,
+          "last_step_at": <iso>
+        }
+    """
+    root = Path(args.project_root).resolve()
+    state_dir = root / STATE_DIR_NAME
+    state_dir.mkdir(parents=True, exist_ok=True)
+    p = state_dir / "session_step.json"
+    current_ancestors = get_ancestor_pids()
+
+    prev: dict[str, Any] = {}
+    if p.exists():
+        try:
+            prev = json.loads(p.read_text())
+        except json.JSONDecodeError:
+            prev = {}
+
+    prev_ancestors = prev.get("ancestor_pids", []) or []
+    same_session = bool(set(current_ancestors) & set(prev_ancestors))
+
+    if args.action == "report":
+        count = prev.get("count", 0) if same_session else 0
+        action_taken = "report"
+    elif args.action == "increment":
+        if same_session:
+            count = prev.get("count", 0) + 1
+            started = prev.get("started_at", now_iso())
+            # Union ancestors so we keep accumulating known session pids
+            merged_ancestors = sorted(set(prev_ancestors) | set(current_ancestors))
+        else:
+            count = 1
+            started = now_iso()
+            merged_ancestors = current_ancestors
+        action_taken = "increment"
+        payload = {
+            "ancestor_pids": merged_ancestors,
+            "count": count,
+            "started_at": started,
+            "last_step_at": now_iso(),
+        }
+        p.write_text(json.dumps(payload, indent=2))
+    elif args.action == "reset":
+        count = 0
+        action_taken = "reset"
+        if p.exists():
+            p.unlink()
+    else:
+        sys.exit(f"ERROR: unknown action {args.action!r}")
+
+    threshold = args.threshold
+    should_pause = count >= threshold
+    out = {
+        "ancestor_pids_sampled": current_ancestors,
+        "same_session_as_last_call": same_session,
+        "count": count,
+        "threshold": threshold,
+        "should_pause": should_pause,
+        "action": action_taken,
+    }
+    print(json.dumps(out, indent=2))
+    return 1 if should_pause else 0
+
+
 def cmd_budget_check(args) -> None:
     root = Path(args.project_root).resolve()
     state = load_state(root)
@@ -657,8 +769,26 @@ def main() -> None:
     p_budget = sub.add_parser("budget-check", help="exit 1 if any budget exceeded")
     p_budget.set_defaults(func=cmd_budget_check)
 
+    p_session = sub.add_parser(
+        "session-step",
+        help="track autopilot step count per Claude Code session (PPID-based); "
+             "reports should_pause=true after threshold steps",
+    )
+    p_session.add_argument(
+        "action",
+        choices=("report", "increment", "reset"),
+        help="report = read without modifying; increment = +1 and save; reset = clear",
+    )
+    p_session.add_argument(
+        "--threshold", type=int, default=DEFAULT_SESSION_STEP_THRESHOLD,
+        help=f"steps in a session before should_pause=true (default {DEFAULT_SESSION_STEP_THRESHOLD})",
+    )
+    p_session.set_defaults(func=cmd_session_step)
+
     args = p.parse_args()
-    args.func(args)
+    rc = args.func(args)
+    if isinstance(rc, int):
+        sys.exit(rc)
 
 
 if __name__ == "__main__":
