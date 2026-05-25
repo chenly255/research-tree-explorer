@@ -412,8 +412,18 @@ def check_reproducibility(branch_dir: Path, failures: list, evidence: dict) -> N
         )
 
 
+CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE: dict[str, set[str]] = {
+    "training": {"RESULT.md", "metrics.json", "data/test_split.json"},
+    "mixed": {"RESULT.md", "metrics.json", "data/test_split.json"},
+    "audit": {"RESULT.md", "audit_report.json"},
+    "analysis": {"RESULT.md", "analysis_output.json"},
+    "data-acquisition": {"RESULT.md", "DATA_MANIFEST.json"},
+}
+
+
 def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
-                      failures: list, evidence: dict) -> None:
+                      failures: list, evidence: dict,
+                      task_type: str = "training") -> None:
     """External codex audit — independent of self-reported charter table.
 
     Anti-forgery defenses (v0.1.3):
@@ -423,6 +433,10 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
     - `files_read`: codex must list every file it read with its SHA256. The
       validator re-hashes the files itself and confirms they match. This proves
       codex actually opened the files (or at least had them at the right state).
+
+    v0.1.9 — task_type-aware required-files set. Earlier versions hardcoded the
+    training file set, which forced data-acquisition / audit / analysis nodes
+    to fail pass-2 even when their physical artifacts were correct.
     """
     codex_path = branch_dir / "CODEX_AUDIT.json"
     if not check_file_exists(codex_path, "CODEX_AUDIT.json", failures):
@@ -464,11 +478,14 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
                 "with at least RESULT.md, metrics.json, data/test_split.json"
             )
             return
-        required_files = {"RESULT.md", "metrics.json", "data/test_split.json"}
+        required_files = CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE.get(
+            task_type, CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE["training"]
+        )
         missing_required = required_files - set(files_read.keys())
         if missing_required:
             failures.append(
-                f"CODEX_AUDIT.json: 'files_read' missing required entries: {sorted(missing_required)}"
+                f"CODEX_AUDIT.json: 'files_read' missing required entries for "
+                f"task_type={task_type}: {sorted(missing_required)}"
             )
             return
         for rel_path, claimed_sha in files_read.items():
@@ -624,16 +641,28 @@ def check_data_acquisition_artifacts(branch_dir: Path, failures: list, evidence:
     for key in required:
         if key not in m:
             failures.append(f"DATA_MANIFEST.json: missing required key '{key}'")
-    # Verify the downloaded file actually exists on disk
+    # Verify the downloaded file(s) actually exist on disk.
+    # v0.1.9: accept both string (single file) and list-of-strings (multi-file pulls
+    # like MSigDB Hallmark + Reactome). Earlier code crashed on list inputs.
     local_rel = m.get("local_path")
-    if local_rel:
-        local_path = branch_dir / local_rel if not Path(local_rel).is_absolute() else Path(local_rel)
-        if not local_path.exists():
-            failures.append(
-                f"DATA_MANIFEST.json: 'local_path' = {local_rel} but file does not exist on disk"
-            )
-        else:
-            evidence["local_file_bytes"] = local_path.stat().st_size
+    if local_rel is not None:
+        local_paths_raw = local_rel if isinstance(local_rel, list) else [local_rel]
+        total_bytes = 0
+        for lp in local_paths_raw:
+            if not isinstance(lp, str):
+                failures.append(
+                    f"DATA_MANIFEST.json: 'local_path' entry not a string: {lp!r}"
+                )
+                continue
+            local_path = branch_dir / lp if not Path(lp).is_absolute() else Path(lp)
+            if not local_path.exists():
+                failures.append(
+                    f"DATA_MANIFEST.json: 'local_path' = {lp} but file does not exist on disk"
+                )
+            else:
+                total_bytes += local_path.stat().st_size
+        if total_bytes:
+            evidence["local_file_bytes"] = total_bytes
 
 
 def check_framing_decision(branch_dir: Path, failures: list, evidence: dict) -> None:
@@ -737,7 +766,7 @@ def main() -> int:
         # Common to all non-framing task types
         check_reproducibility(branch_dir, failures, evidence)
         if args.require_codex_audit:
-            check_codex_audit(branch_dir, nonce_path, failures, evidence)
+            check_codex_audit(branch_dir, nonce_path, failures, evidence, task_type=task_type)
         check_done_ready(branch_dir, table, failures, evidence, task_type=task_type)
 
     if failures:

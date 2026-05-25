@@ -35,6 +35,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -55,7 +56,23 @@ SCHEMA_VERSION = "0.2"
 # `human-gate clear`.
 HUMAN_GATE_FILE_NAME = "AWAITING_HUMAN.md"
 
-VALID_STATUSES = {"pending", "expanded", "running", "completed", "dead"}
+VALID_STATUSES = {
+    "pending",     # not yet picked
+    "expanded",    # orchestrator has called expand and created children
+    "running",     # subagent currently working (foreground or background)
+    "completed",   # validated + (optionally) codex-audited PASS
+    "dead",        # validator FAIL, DEAD.md, or final failure
+    # v0.2.0 — new status for agent-driven sub-forks. A `forked` node has
+    # children that an agent decided to create mid-execution (SUBTREE_FORK.md
+    # path), not orchestrator-driven expand. `forked` behaves like `expanded`
+    # for pick-next (skip parent, pick child), but synthesize_report counts
+    # it separately so the final report can show the agent's autonomy.
+    "forked",
+    # v0.2.0 — agent-driven retreat. NOT a death. The branch wasn't completed
+    # but it's set aside; Lily can `resume-branch` later. Used by /research-tree
+    # backtrack (interactive co-pilot mode).
+    "abandoned",
+}
 
 # v0.1.6 — task_type: each branch can declare what KIND of work it does, so
 # the charter validator picks the right schema (e.g. an audit branch does
@@ -86,12 +103,16 @@ SET_ALLOWED_KEYS = {
 # Session step counter — autopilot reports `should_pause: true` when this many
 # steps have accumulated within a single Claude Code session, so the user can
 # restart for a clean context. Default tuned to ~30-40% of typical context window.
-# v0.1.8 — lowered from 20 to 10. Empirically 20 was too generous: by step
-# 15-20 the main Claude Code context was already near its working ceiling,
-# and the per-step orchestration paragraph (even in --silent mode, until
-# v0.1.8's fast-exit) compounded the drift. 10 keeps the main context fresh
-# enough to write the per-step summary that lands when /loop ticks back in.
+#
+# v0.1.9 — bifurcate by silent vs chatty mode (env: RESEARCH_TREE_SILENT=1).
+# Rationale: in --silent mode each step contributes only a tiny shell-call sized
+# blob to main context (gate check ~10 tokens), so 10 was wildly conservative.
+# Lily's overnight runs need 10+ hours unattended; with cron at 30-min cadence
+# that's 20+ ticks per session. We raise the silent threshold to 80 (≈ 40 hours
+# of safe unattended runtime); chatty mode keeps 10 since it actually does emit
+# a per-step paragraph and drifts faster.
 DEFAULT_SESSION_STEP_THRESHOLD = 10
+SILENT_SESSION_STEP_THRESHOLD = 80
 
 
 def state_path(root: Path) -> Path:
@@ -306,6 +327,15 @@ def cmd_add(args) -> None:
             "task_type": task_type,
             "depends_on": depends_on,
             "human_only": human_only,
+            # v0.2.0 — agent-driven branch fields. Default to agent-capable so
+            # new nodes can take advantage of the agent execute mode without
+            # explicit opt-in. Set agent_capable=false to force script-only mode.
+            "agent_capable": True,
+            "repair_attempts": 0,
+            "max_repair_attempts": 2,
+            "last_failure_context": None,
+            "spawned_by_agent": getattr(args, "spawned_by_agent", None),
+            "subtree_origin": getattr(args, "subtree_origin", "orchestrator"),
             "created_at": now_iso(),
         }
         state["nodes"][new_id] = new_node
@@ -418,9 +448,9 @@ def cmd_running(args) -> None:
         if args.node_id not in state["nodes"]:
             sys.exit(f"ERROR: node {args.node_id!r} not found.")
         node = state["nodes"][args.node_id]
-        if node["status"] not in ("pending", "expanded"):
+        if node["status"] not in ("pending", "expanded", "forked", "abandoned"):
             sys.exit(
-                f"ERROR: can only mark pending/expanded nodes as running. "
+                f"ERROR: can only mark pending/expanded/forked/abandoned nodes as running. "
                 f"Current status: {node['status']}"
             )
         _apply_status_transition(state, node, "running")
@@ -511,6 +541,170 @@ def cmd_reopen(args) -> None:
     print(json.dumps(node, indent=2, ensure_ascii=False))
 
 
+def cmd_backtrack(args) -> None:
+    """v0.2.1 — interactive co-pilot: set a node to `abandoned` (not dead, but
+    parked). Used when Lily looks at a branch's result and decides "not pursuing
+    this further, but might come back". Differs from die: no `death_reason`,
+    no codex audit trail, downstream `_dep_has_dead_in_chain` does NOT cascade.
+
+    Use case: an autopilot tick runs node 1.2, result is mediocre but not bad;
+    Lily wants to try its sibling 1.3 first; she runs `/research-tree backtrack 1.2`
+    and the tree pick-next will pick 1.3 next. Later `resume-branch 1.2` revives.
+    """
+    root = Path(args.project_root or ".").resolve()
+    with state_lock(root):
+        state = load_state(root)
+        if args.node_id not in state["nodes"]:
+            sys.exit(f"ERROR: node {args.node_id!r} not found.")
+        node = state["nodes"][args.node_id]
+        if node["status"] not in ("pending", "running", "expanded", "forked"):
+            sys.exit(
+                f"ERROR: cannot backtrack from status {node['status']!r}; "
+                f"only pending/running/expanded/forked may be set aside."
+            )
+        node["status"] = "abandoned"
+        if args.reason:
+            node["abandon_reason"] = args.reason
+        node["updated_at"] = now_iso()
+        save_state(root, state)
+    print(json.dumps(node, indent=2, ensure_ascii=False))
+
+
+def cmd_resume_branch(args) -> None:
+    """v0.2.1 — un-abandon a node, set back to pending. Counterpart to backtrack."""
+    root = Path(args.project_root or ".").resolve()
+    with state_lock(root):
+        state = load_state(root)
+        if args.node_id not in state["nodes"]:
+            sys.exit(f"ERROR: node {args.node_id!r} not found.")
+        node = state["nodes"][args.node_id]
+        if node["status"] != "abandoned":
+            sys.exit(
+                f"ERROR: resume-branch only works on abandoned nodes; "
+                f"current status is {node['status']!r}."
+            )
+        node["status"] = "pending"
+        node.pop("abandon_reason", None)
+        node["updated_at"] = now_iso()
+        save_state(root, state)
+    print(json.dumps(node, indent=2, ensure_ascii=False))
+
+
+def cmd_suggest_next(args) -> None:
+    """v0.2.1 — interactive co-pilot helper. Compute 3-5 suggested next moves
+    based on current tree state. Output JSON list, each item:
+      {action: deepen|sibling|backtrack|pivot|done, target_id, reason}
+
+    Logic (best-first heuristics):
+      1. Most recent COMPLETED node with no children → deepen (expand it)
+      2. Latest junction with mixed completed/dead children + no audit yet → audit it
+      3. Sibling of running/pending current focus that hasn't been tried → try sibling
+      4. Whole-tree dead-end (all root branches dead/abandoned) → pivot
+      5. tree.json says done_ready=true on any completed node → handoff
+    """
+    root = Path(args.project_root or ".").resolve()
+    state = load_state(root)
+    nodes = state["nodes"]
+    suggestions: list[dict[str, Any]] = []
+
+    # 1. Recently completed leaf with no children — deepen candidate
+    completed_leaves = sorted(
+        [n for n in nodes.values() if n["status"] == "completed" and not n["children"]],
+        key=lambda n: n.get("updated_at", ""),
+        reverse=True,
+    )
+    for cn in completed_leaves[:2]:
+        suggestions.append({
+            "action": "deepen",
+            "target_id": cn["id"],
+            "reason": f"node {cn['id']} ({cn['title'][:50]}) completed with score "
+                      f"{cn.get('score')} and has no children — worth expanding into "
+                      f"ablations / sibling experiments",
+        })
+
+    # 2. Pending sibling of a recently-completed node — try the unattempted approach
+    for cn in completed_leaves[:1]:
+        parent_id = cn.get("parent")
+        if not parent_id or parent_id not in nodes:
+            continue
+        for sib_id in nodes[parent_id].get("children", []):
+            if sib_id == cn["id"]:
+                continue
+            sib = nodes.get(sib_id)
+            if sib and sib["status"] == "pending":
+                suggestions.append({
+                    "action": "sibling",
+                    "target_id": sib_id,
+                    "reason": f"sibling {sib_id} of completed {cn['id']} is still "
+                              f"pending — head-to-head comparison opportunity",
+                })
+                break
+
+    # 3. Junctions with mixed children needing audit
+    for nid, n in nodes.items():
+        if n.get("junction_audit_id"):
+            continue
+        if n["status"] not in ("expanded", "forked"):
+            continue
+        kids = [nodes.get(c, {}) for c in n.get("children", [])]
+        has_completed = any(k.get("status") == "completed" for k in kids)
+        has_dead = any(k.get("status") == "dead" for k in kids)
+        if has_completed and has_dead:
+            suggestions.append({
+                "action": "audit",
+                "target_id": nid,
+                "reason": f"junction {nid} has both completed and dead children but "
+                          f"no junction audit yet — codex can red-team prune/deepen",
+            })
+
+    # 4. Whole-tree dead-end check
+    root_children = nodes.get("root", {}).get("children", [])
+    if root_children:
+        all_root_dead_or_abandoned = all(
+            nodes[c]["status"] in ("dead", "abandoned")
+            for c in root_children
+            if c in nodes
+        )
+        if all_root_dead_or_abandoned:
+            suggestions.append({
+                "action": "pivot",
+                "target_id": "root",
+                "reason": "all root branches are dead or abandoned — root idea may "
+                          "be misframed; recommend /idea-pipeline to re-scope",
+            })
+
+    # 5. Any done_ready completed node — handoff to human
+    for nid, n in nodes.items():
+        if n["status"] == "completed" and n.get("done_ready"):
+            suggestions.append({
+                "action": "handoff",
+                "target_id": nid,
+                "reason": f"node {nid} marked DONE_READY=true and validator + codex "
+                          f"both PASSed — hand off to human for paper writing",
+            })
+
+    # Default if nothing — just pick-next
+    if not suggestions:
+        suggestions.append({
+            "action": "pick_next",
+            "target_id": None,
+            "reason": "no specific guidance — run /research-tree autopilot to pick next leaf",
+        })
+
+    print(json.dumps({
+        "suggestions": suggestions[:5],
+        "tree_summary": {
+            "total": len(nodes),
+            "completed": sum(1 for n in nodes.values() if n["status"] == "completed"),
+            "dead": sum(1 for n in nodes.values() if n["status"] == "dead"),
+            "pending": sum(1 for n in nodes.values() if n["status"] == "pending"),
+            "running": sum(1 for n in nodes.values() if n["status"] == "running"),
+            "abandoned": sum(1 for n in nodes.values() if n["status"] == "abandoned"),
+            "forked": sum(1 for n in nodes.values() if n["status"] == "forked"),
+        },
+    }, indent=2, ensure_ascii=False))
+
+
 def cmd_get(args) -> None:
     root = Path(args.project_root).resolve()
     state = load_state(root)
@@ -533,6 +727,8 @@ def cmd_list(args) -> None:
             "running": "►",
             "completed": "✓",
             "dead": "✗",
+            "forked": "⤳",       # v0.2.0 agent-driven sub-fork
+            "abandoned": "⏸",     # v0.2.0 set aside (not dead)
         }.get(n["status"], "?")
         print(f"  {marker} [{n['id']:<6}] depth={n['depth']} score={score:>5} {n['kind']:<12} {n['title']}")
 
@@ -554,6 +750,233 @@ def _deps_satisfied(state: dict, node: dict) -> tuple[bool, list[str]]:
         if dep_node.get("status") != "completed":
             unmet.append(dep_id)
     return (len(unmet) == 0, unmet)
+
+
+def _dep_has_dead_in_chain(state: dict, node: dict, _seen: set | None = None) -> str | None:
+    """v0.1.9 — does this node have any DEAD ancestor in its depends_on graph?
+
+    Returns the dead dep id closest to the node (one-hop preferred), or None.
+    Used by cascade-reap to avoid zombie-pending nodes after their prerequisite
+    died on cosmetic / non-recoverable failure.
+    """
+    _seen = _seen or set()
+    for dep_id in node.get("depends_on", []) or []:
+        if dep_id in _seen:
+            continue
+        _seen.add(dep_id)
+        dep_node = state["nodes"].get(dep_id)
+        if dep_node is None:
+            continue
+        if dep_node.get("status") == "dead":
+            return dep_id
+        # walk transitively in case the dep itself depended on a dead grandparent
+        deeper = _dep_has_dead_in_chain(state, dep_node, _seen)
+        if deeper:
+            return deeper
+    return None
+
+
+def cmd_repair_retry(args) -> None:
+    """v0.2.0 — AIDE-style buggy retry. When validator FAIL or codex FAIL, instead
+    of permanently dying the node, increment repair_attempts and reset to pending
+    so autopilot picks it again. The next attempt's agent prompt will receive
+    last_failure_context so it can learn from the prior failure.
+
+    Caller passes --failure-context (string, usually first validator failure line)
+    so the retry agent knows what to avoid. If repair_attempts >= max_repair_attempts,
+    refuses and the caller should call `die` instead.
+
+    Output: JSON {repair_attempts, allowed_more_retries, ...}.
+    Exit code 0 if retry granted, 2 if exhausted (caller should die the node).
+    """
+    root = Path(args.project_root or ".").resolve()
+    state = load_state(root)
+    if args.node_id not in state["nodes"]:
+        sys.exit(f"ERROR: node {args.node_id} not in tree")
+    node = state["nodes"][args.node_id]
+    if node["status"] not in ("running", "pending", "expanded"):
+        sys.exit(
+            f"ERROR: cannot retry node in status {node['status']!r}; "
+            f"retry only valid for running/pending/expanded."
+        )
+    current_attempts = int(node.get("repair_attempts", 0))
+    max_attempts = int(node.get("max_repair_attempts", 2))
+    if current_attempts >= max_attempts:
+        print(json.dumps({
+            "node_id": args.node_id,
+            "repair_attempts": current_attempts,
+            "max_repair_attempts": max_attempts,
+            "allowed_more_retries": False,
+            "advice": "retry budget exhausted; caller should die this node",
+        }, indent=2))
+        return 2
+    node["repair_attempts"] = current_attempts + 1
+    node["last_failure_context"] = args.failure_context
+    node["status"] = "pending"
+    node["updated_at"] = now_iso()
+    save_state(root, state)
+    print(json.dumps({
+        "node_id": args.node_id,
+        "repair_attempts": node["repair_attempts"],
+        "max_repair_attempts": max_attempts,
+        "allowed_more_retries": node["repair_attempts"] < max_attempts,
+        "status_now": "pending",
+    }, indent=2))
+    return 0
+
+
+def cmd_apply_subtree_fork(args) -> None:
+    """v0.2.0 — read .research-tree/branches/<node>/SUBTREE_FORK.md (JSON inside)
+    and create the candidate children via the same code path as cmd_add. Then
+    set parent status to `forked` (new in v0.2.0). After this, autopilot
+    pick-next will find the new children and descend.
+
+    SUBTREE_FORK.md format (front-matter optional, JSON body required):
+
+        # reason for fork: <one line>
+        ```json
+        {
+          "candidates": [
+            {"placeholder_id": "...", "kind": "...", "task_type": "...",
+             "title": "...", "description": "...",
+             "human_only": false, "depends_on_placeholders": []}
+          ]
+        }
+        ```
+
+    Exit 0 on success, 2 on parse / validation error.
+    """
+    root = Path(args.project_root or ".").resolve()
+    state = load_state(root)
+    if args.node_id not in state["nodes"]:
+        sys.exit(f"ERROR: node {args.node_id} not in tree")
+    parent = state["nodes"][args.node_id]
+    if parent["status"] not in ("running", "pending"):
+        sys.exit(
+            f"ERROR: can only fork from a running/pending node, got {parent['status']!r}"
+        )
+    fork_path = root / STATE_DIR_NAME / "branches" / args.node_id / "SUBTREE_FORK.md"
+    if not fork_path.exists():
+        sys.exit(f"ERROR: SUBTREE_FORK.md not found at {fork_path}")
+    text = fork_path.read_text()
+    m = re.search(r"```json\s*(.*?)```", text, re.DOTALL)
+    if not m:
+        # fall back: assume the whole file is JSON
+        m_json_blob = text
+    else:
+        m_json_blob = m.group(1)
+    try:
+        payload = json.loads(m_json_blob)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: SUBTREE_FORK.md JSON block malformed: {e}")
+    candidates = payload.get("candidates", [])
+    if not candidates:
+        sys.exit("ERROR: SUBTREE_FORK.md has no candidates[]")
+    if len(candidates) > 4:
+        sys.exit(f"ERROR: SUBTREE_FORK.md proposes {len(candidates)} candidates; max 4")
+
+    # Two-pass add (same pattern as expand): assign real ids first, then patch deps
+    placeholder_to_id: dict[str, str] = {}
+    added_ids: list[str] = []
+    for c in candidates:
+        kind = c.get("kind", "custom")
+        if kind not in VALID_KINDS:
+            sys.exit(f"ERROR: candidate kind {kind!r} not in {sorted(VALID_KINDS)}")
+        task_type = c.get("task_type", "mixed")
+        if task_type not in VALID_TASK_TYPES:
+            sys.exit(f"ERROR: candidate task_type {task_type!r} not in {sorted(VALID_TASK_TYPES)}")
+        new_id = next_id(state, args.node_id)
+        new_node = {
+            "id": new_id,
+            "parent": args.node_id,
+            "depth": parent["depth"] + 1,
+            "kind": kind,
+            "status": "pending",
+            "title": c.get("title", "")[:200],
+            "description": c.get("description", c.get("title", "")),
+            "score": None,
+            "death_reason": None,
+            "death_evidence": None,
+            "completion_proof": None,
+            "junction_audit_id": None,
+            "branch_dir": f"{STATE_DIR_NAME}/branches/{new_id}",
+            "children": [],
+            "direct_executable": False,
+            "task_type": task_type,
+            "depends_on": [],
+            "human_only": bool(c.get("human_only", False)),
+            "agent_capable": True,
+            "repair_attempts": 0,
+            "max_repair_attempts": 2,
+            "last_failure_context": None,
+            "spawned_by_agent": args.node_id,
+            "subtree_origin": "agent_fork",
+            "created_at": now_iso(),
+        }
+        state["nodes"][new_id] = new_node
+        parent["children"].append(new_id)
+        state["stats"]["nodes_total"] += 1
+        # create branch_dir on disk so executor can write into it
+        Path(root / new_node["branch_dir"]).mkdir(parents=True, exist_ok=True)
+        placeholder = c.get("placeholder_id", new_id)
+        placeholder_to_id[placeholder] = new_id
+        added_ids.append(new_id)
+
+    # Pass 2 — translate depends_on_placeholders
+    for c, new_id in zip(candidates, added_ids):
+        deps_placeholders = c.get("depends_on_placeholders") or []
+        if not deps_placeholders:
+            continue
+        resolved = []
+        for ph in deps_placeholders:
+            if ph in placeholder_to_id:
+                resolved.append(placeholder_to_id[ph])
+            elif ph in state["nodes"]:
+                resolved.append(ph)
+            else:
+                sys.exit(
+                    f"ERROR: candidate {new_id} depends_on_placeholders contains "
+                    f"unknown placeholder/id {ph!r}"
+                )
+        state["nodes"][new_id]["depends_on"] = resolved
+
+    # Mark parent as forked (new v0.2.0 status — distinct from orchestrator expanded)
+    parent["status"] = "forked"
+    parent["updated_at"] = now_iso()
+    save_state(root, state)
+    print(json.dumps({
+        "parent_id": args.node_id,
+        "parent_status_now": "forked",
+        "added_ids": added_ids,
+        "placeholder_to_id": placeholder_to_id,
+    }, indent=2, ensure_ascii=False))
+
+
+def cmd_cascade_reap(args) -> None:
+    """v0.1.9 — find pending nodes whose depends_on chain contains a dead node
+    and mark them dead with reason `parent_dep_died:<id>`. This prevents
+    zombie-lock where a single cosmetic failure stalls the whole subtree.
+
+    Idempotent. Run from autopilot step 1.7 (after stale-running sweep,
+    before pick-next). Outputs JSON list of newly-reaped node ids.
+    """
+    root = Path(args.project_root or ".").resolve()
+    state = load_state(root)
+    reaped: list[dict[str, str]] = []
+    for nid, node in state["nodes"].items():
+        if node.get("status") != "pending":
+            continue
+        dead_dep = _dep_has_dead_in_chain(state, node)
+        if dead_dep is None:
+            continue
+        node["status"] = "dead"
+        node["death_reason"] = f"parent_dep_died:{dead_dep}"
+        node["death_evidence"] = None
+        node["updated_at"] = now_iso()
+        reaped.append({"node_id": nid, "killed_by_dep": dead_dep})
+    if reaped:
+        save_state(root, state)
+    print(json.dumps({"reaped": reaped, "count": len(reaped)}, indent=2))
 
 
 def cmd_pick_next(args) -> None:
@@ -626,6 +1049,8 @@ def cmd_tree(args) -> None:
             "running": "►",
             "completed": "✓",
             "dead": "✗",
+            "forked": "⤳",       # v0.2.0 agent-driven sub-fork
+            "abandoned": "⏸",     # v0.2.0 set aside (not dead)
         }.get(n["status"], "?")
         score = f" [{n['score']:.2f}]" if n["score"] is not None else ""
         connector = "└── " if is_last else "├── "
@@ -947,6 +1372,18 @@ def main() -> None:
         action="store_true",
         help="mark branch as human-only (autopilot pick-next skips; user must execute manually)",
     )
+    # v0.2.0 — agent fork lineage tracking. Set by cmd_apply_subtree_fork when
+    # an agent decided to fork its own subtree; not normally used directly.
+    p_add.add_argument(
+        "--spawned-by-agent", default=None,
+        help="node_id of the agent that decided to spawn this child (v0.2.0)",
+    )
+    p_add.add_argument(
+        "--subtree-origin",
+        default="orchestrator",
+        choices=("orchestrator", "agent_fork", "repair_retry"),
+        help="who created this node — orchestrator expand, agent self-fork, or repair retry",
+    )
     p_add.set_defaults(func=cmd_add)
 
     p_set = sub.add_parser(
@@ -1011,6 +1448,61 @@ def main() -> None:
     p_deps.add_argument("node_id")
     p_deps.set_defaults(func=cmd_deps)
 
+    # v0.1.9 — cascade-reap: kill pending nodes whose dep chain has a dead ancestor.
+    # Prevents zombie-lock after a single cosmetic failure stalls a subtree.
+    p_reap = sub.add_parser(
+        "cascade-reap",
+        help="kill pending nodes blocked by dead deps (cascade-die, prevents "
+             "zombie-lock after a single cosmetic / non-recoverable failure)",
+    )
+    p_reap.set_defaults(func=cmd_cascade_reap)
+
+    # v0.2.0 — AIDE-style buggy retry: give a failed node N attempts before
+    # final die. Caller passes the failure context so the retry agent can learn.
+    p_retry = sub.add_parser(
+        "repair-retry",
+        help="increment repair_attempts and reset node to pending (AIDE-style). "
+             "Use after validator/codex FAIL when repair budget remains. "
+             "Exit 2 if budget exhausted (caller should die node).",
+    )
+    p_retry.add_argument("node_id")
+    p_retry.add_argument("--failure-context", required=True,
+                         help="one-line description of what failed, passed to next agent")
+    p_retry.set_defaults(func=cmd_repair_retry)
+
+    # v0.2.0 — apply-subtree-fork: agent wrote SUBTREE_FORK.md; parse + add kids.
+    p_fork = sub.add_parser(
+        "apply-subtree-fork",
+        help="read .research-tree/branches/<id>/SUBTREE_FORK.md and create the "
+             "candidate children listed inside. Parent becomes status=forked.",
+    )
+    p_fork.add_argument("node_id")
+    p_fork.set_defaults(func=cmd_apply_subtree_fork)
+
+    # v0.2.1 — interactive co-pilot
+    p_back = sub.add_parser(
+        "backtrack",
+        help="set a node aside without dying it. Use when human reviewer wants to "
+             "try a sibling first; revive later with resume-branch.",
+    )
+    p_back.add_argument("node_id")
+    p_back.add_argument("--reason", default=None)
+    p_back.set_defaults(func=cmd_backtrack)
+
+    p_resume_branch = sub.add_parser(
+        "resume-branch",
+        help="un-abandon a node (set back to pending). Counterpart to backtrack.",
+    )
+    p_resume_branch.add_argument("node_id")
+    p_resume_branch.set_defaults(func=cmd_resume_branch)
+
+    p_suggest = sub.add_parser(
+        "suggest-next",
+        help="output 3-5 recommended next moves based on current tree state. "
+             "Used by /research-tree step in interactive co-pilot mode.",
+    )
+    p_suggest.set_defaults(func=cmd_suggest_next)
+
     p_tree = sub.add_parser("tree", help="ASCII tree visualization")
     p_tree.set_defaults(func=cmd_tree)
 
@@ -1037,9 +1529,19 @@ def main() -> None:
         choices=("report", "increment", "reset"),
         help="report = read without modifying; increment = +1 and save; reset = clear",
     )
+    # v0.1.9 — pick threshold default based on silent vs chatty mode.
+    # The autopilot orchestrator exports RESEARCH_TREE_SILENT=1 when invoked
+    # via `autopilot --silent` so unattended overnight runs can chew through
+    # ~80 ticks before the gate raises (vs 10 in chatty mode).
+    _silent = os.environ.get("RESEARCH_TREE_SILENT", "0") == "1"
+    _default_threshold = (
+        SILENT_SESSION_STEP_THRESHOLD if _silent else DEFAULT_SESSION_STEP_THRESHOLD
+    )
     p_session.add_argument(
-        "--threshold", type=int, default=DEFAULT_SESSION_STEP_THRESHOLD,
-        help=f"steps in a session before should_pause=true (default {DEFAULT_SESSION_STEP_THRESHOLD})",
+        "--threshold", type=int, default=_default_threshold,
+        help=(f"steps before should_pause=true (env RESEARCH_TREE_SILENT=1 "
+              f"raises default to {SILENT_SESSION_STEP_THRESHOLD}; otherwise "
+              f"{DEFAULT_SESSION_STEP_THRESHOLD})"),
     )
     p_session.set_defaults(func=cmd_session_step)
 

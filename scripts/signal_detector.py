@@ -291,7 +291,7 @@ def aggregate(parent_id: str, project_root: Path, cfg: dict | None = None) -> di
     if parent is None:
         return {"error": f"parent {parent_id} not in tree"}
 
-    child_ids = [nid for nid, n in nodes.items() if n.get("parent_id") == parent_id]
+    child_ids = [nid for nid, n in nodes.items() if n.get("parent") == parent_id]
     classifications: list[dict[str, Any]] = []
     for cid in child_ids:
         child = nodes[cid]
@@ -362,7 +362,7 @@ def check_pivot(project_root: Path, cfg: dict | None = None) -> dict[str, Any]:
 
     junctions: list[str] = []
     for nid, n in nodes.items():
-        child_ids = [cid for cid, c in nodes.items() if c.get("parent_id") == nid]
+        child_ids = [cid for cid, c in nodes.items() if c.get("parent") == nid]
         if len(child_ids) >= cfg["min_siblings_for_aggregate"]:
             junctions.append(nid)
 

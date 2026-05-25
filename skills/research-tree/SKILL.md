@@ -65,6 +65,9 @@ The first token of `$ARGUMENTS` is the subcommand. Dispatch on it. If empty or `
 /research-tree status                       — ASCII tree + stats
 /research-tree synthesize                   — write FINAL_REPORT.md from current tree
 /research-tree autopilot [max_loops=20]     — full loop: pick → expand-or-execute → audit → repeat until stop criterion
+/research-tree step                         — v0.2.1 interactive: run ONE autopilot step + surface suggested next moves (deepen/sibling/audit/pivot/handoff)
+/research-tree backtrack <node_id>          — v0.2.1 set node aside (NOT die); use when reviewer wants to try sibling first
+/research-tree resume-branch <node_id>      — v0.2.1 un-abandon a node back to pending
 /research-tree resume                       — clear human-gate + reset session step counter, then run one autopilot step
 /research-tree human-gate                   — admin: check/set/clear the AWAITING_HUMAN.md fast-exit sentinel
 ```
@@ -73,7 +76,7 @@ The first token of `$ARGUMENTS` is the subcommand. Dispatch on it. If empty or `
 When the user invokes `resume`, do this BEFORE dispatching to autopilot logic:
 ```bash
 python3 "$TREE_STATE" human-gate clear --project-root "$(pwd)"
-python3 "$TREE_STATE" session-step reset --project-root "$(pwd)" --threshold 10
+python3 "$TREE_STATE" session-step reset --project-root "$(pwd)"
 ```
 This is the only path that clears the gate. Resuming explicitly signals "human
 has handled whatever was awaiting them; reopen exploration". Then fall through
@@ -308,6 +311,42 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
 
      **Pure-compute exceptions**: if your task takes < 60 seconds total (small unit test, file inspection, small classifier on toy data) you may run it foreground. In that case, do NOT write EXECUTOR.json — just produce RESULT.md or DEAD.md directly. The orchestrator distinguishes the two modes by EXECUTOR.json presence."
    - **Pastes RESEARCH_CHARTER.md in full and says: "Obey the charter. The final RESULT.md MUST end with the charter compliance audit table from §Charter compliance audit format. Any FAIL on a (strict) rule means you write DEAD.md instead of RESULT.md, with death_reason='charter_violation: <which rule>'. Honest failure beats fake success."**
+   - **v0.2.0 — 4 output modes the agent can produce** (NEW: agent has authority to fork or pivot, not just succeed/fail). Tell the subagent verbatim:
+
+     "You have FOUR ways to end your run, write exactly one of these files in the branch_dir:
+
+     (a) **`RESULT.md`** — work completed successfully. Include METRIC + KEY_FINDING + ARTIFACTS + charter compliance table per the task_type schema below. This is the default outcome.
+
+     (b) **`DEAD.md`** — work cannot finish. Hypothesis falsified, blocker hit, charter rule violated. Write one line `death_reason: <one-sentence>`, then a paragraph of context. **Honest failure beats fake success.**
+
+     (c) **`SUBTREE_FORK.md`** (v0.2.0 NEW) — you discovered mid-flight that this step actually has 2-4 genuinely distinct sub-approaches worth competing. Don't pick one yourself, hand control back to the orchestrator who will run each. Format:
+     ```
+     # Why fork: <one line>
+     ```json
+     {
+       \"candidates\": [
+         {\"placeholder_id\": \"a\", \"kind\": \"ablation\", \"task_type\": \"training\",
+          \"title\": \"<≤80 chars>\", \"description\": \"<2-4 sentences>\",
+          \"human_only\": false, \"depends_on_placeholders\": []},
+         ...
+       ]
+     }
+     ```
+     Use this when: the original node description compressed a real branching decision (e.g. 'try GSVA vs AUCell vs ssGSEA' bundled as one node, but each is its own training run worth competing). Don't use this to escape work — codex audit catches that. Maximum 4 candidates.
+
+     (d) **`SUBTREE_PIVOT.md`** (v0.2.0 NEW) — you discovered the entire hypothesis of this branch is wrong and a different framing is needed. NOT a fork (parallel siblings) — a redirect. Format:
+     ```
+     reason: <one-line: what makes the original hypothesis dead>
+     suggest_new_parent_node_kind: <kind, e.g. narrative / experiment>
+     suggest_new_node_title: <≤80 chars proposing the new direction>
+     evidence: <2-3 sentences why this is a pivot not a fork>
+     ```
+     Use this VERY sparingly — only when continuing makes no sense. Orchestrator will raise human-gate so Lily decides whether to follow the pivot. If you're tempted to write this, double-check it's not actually (c).
+
+     **Decision rule** for which mode: complete work → (a). Hit a blocker → (b). Mid-flight discovered real internal forks → (c). Mid-flight discovered the whole branch is misframed → (d). Default to (a). Use (c)/(d) only when you genuinely cannot make a single principled forward choice."
+
+   - **v0.2.0 — retry context**. If this node's `last_failure_context` field is non-null, paste it at the top of the agent prompt verbatim under header "PREVIOUS ATTEMPT FAILED — avoid repeating these specific mistakes:". Get the field by running `python3 "$TREE_STATE" get <node_id> | python3 -c "import json,sys; print(json.load(sys.stdin).get('last_failure_context') or '')"`. The agent knows what NOT to do.
+
    - **v0.1.6 — task_type-aware artifact requirements**. Read the node's `task_type` field (from `python3 "$TREE_STATE" get <node_id>` → `.task_type`) and tell the subagent the artifact set that matches its task_type. The orchestrator MUST select ONE of the following blocks based on the node's `task_type`:
 
      **For `task_type=training` (default, v0.1.5 behavior)**:
@@ -377,23 +416,65 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
      ```
      If the EXECUTOR.json says a process is alive and neither RESULT.md nor DEAD.md exists yet, **end the autopilot step here** with the node still in `running` state. A later autopilot cycle (driven by `/loop`) will detect completion via `stale_running_handler.py` and resume from step 6a.
    - Otherwise (no EXECUTOR.json, or process is dead, or output files already exist), proceed with the validation chain. Every status transition uses the dedicated `complete` / `die` commands; `set` cannot change status anymore (the state machine refuses it):
-   - **6a. Quick triage**:
-     - If `DEAD.md` exists: `python3 "$TREE_STATE" die <node_id> --reason "<first line of DEAD.md>" --evidence ".research-tree/branches/<node_id>/DEAD.md"`. Done — skip to step 7.
-     - If `RESULT.md` is missing AND EXECUTOR.json exists AND process is dead: `python3 "$TREE_STATE" die <node_id> --reason "executor process exited without writing RESULT.md or DEAD.md — see EXECUTOR.json log_file"`. Done — skip to step 7.
-     - If `RESULT.md` is missing (no executor either): `python3 "$TREE_STATE" die <node_id> --reason "execution returned no RESULT.md and no DEAD.md"`. Done — skip to step 7.
+   - **6a. Quick triage** (v0.2.0 — 4 output modes recognized):
+     - **`SUBTREE_FORK.md` exists** (v0.2.0 — agent decided mid-flight that this step has 2-4 real sub-forks worth competing): apply the fork and STOP — the new pending children will be picked next autopilot tick.
+       ```bash
+       python3 "$TREE_STATE" --project-root "$(pwd)" apply-subtree-fork <node_id>
+       ```
+       The command parses `SUBTREE_FORK.md`, creates the candidate children, marks parent status=`forked`. Done — skip to step 7. **Do not also try to validate RESULT.md if both exist — fork takes precedence (a forking branch hasn't finished its own work).**
+     - **`SUBTREE_PIVOT.md` exists** (v0.2.0 — agent discovered the whole hypothesis is wrong; not fork but redirect): die the node + raise human-gate so Lily can decide whether to follow the pivot suggestion.
+       ```bash
+       python3 "$TREE_STATE" die <node_id> --reason "agent_pivot: $(grep -m1 reason .research-tree/branches/<node_id>/SUBTREE_PIVOT.md | sed 's/^reason:\s*//')" --evidence ".research-tree/branches/<node_id>/SUBTREE_PIVOT.md"
+       cp .research-tree/branches/<node_id>/SUBTREE_PIVOT.md .research-tree/PIVOT_PROPOSAL.md
+       python3 "$TREE_STATE" --project-root "$(pwd)" human-gate set --reason "AGENT_PIVOT from <node_id>: read .research-tree/PIVOT_PROPOSAL.md and decide whether to follow the suggested new direction. Run /research-tree resume after deciding."
+       ```
+       Done — skip to step 7. autopilot stops.
+     - **`DEAD.md` exists**: `python3 "$TREE_STATE" die <node_id> --reason "<first line of DEAD.md>" --evidence ".research-tree/branches/<node_id>/DEAD.md"`. Done — skip to step 7.
+     - **`RESULT.md` missing AND EXECUTOR.json exists AND process is dead**: `python3 "$TREE_STATE" die <node_id> --reason "executor process exited without writing RESULT.md or DEAD.md — see EXECUTOR.json log_file"`. Done — skip to step 7.
+     - **`RESULT.md` missing (no executor either)**: `python3 "$TREE_STATE" die <node_id> --reason "execution returned no RESULT.md and no DEAD.md"`. Done — skip to step 7.
    - **6b. Programmatic charter validation pass 1** (always runs, never skipped):
      ```bash
      python3 "$VALIDATOR" ".research-tree/branches/<node_id>" > .research-tree/branches/<node_id>/VALIDATION.json 2> .research-tree/branches/<node_id>/VALIDATION.stderr
      VALIDATOR_EXIT=$?
      ```
-     If `VALIDATOR_EXIT != 0` (FAIL or WARN): read VALIDATION.json `failures[]`/`warnings[]`, take the first item, then `python3 "$TREE_STATE" die <node_id> --reason "validator: <first failure-or-warning>" --evidence ".research-tree/branches/<node_id>/VALIDATION.json"`. Done — skip to step 7. **Do not argue with the validator. Do not re-spawn the subagent to "try again". Both FAIL and WARN kill the branch — strict-by-default is the design.**
-   - **6c. External codex audit** (always runs when 6b returned PASS, fail-CLOSED if codex unavailable):
+     If `VALIDATOR_EXIT != 0` (FAIL or WARN): read VALIDATION.json `failures[]`/`warnings[]`, take the first item. v0.2.0: try AIDE-style repair retry first (max 2 attempts), THEN die. This gives the agent a chance to learn from the failure and try again — but only twice per node, so the tree doesn't loop forever:
+     ```bash
+     FAIL_LINE=$(python3 -c "import json; v=json.load(open('.research-tree/branches/<node_id>/VALIDATION.json')); f=(v.get('failures') or v.get('warnings') or ['?'])[0]; print(f)")
+     python3 "$TREE_STATE" --project-root "$(pwd)" repair-retry <node_id> --failure-context "validator pass-1: $FAIL_LINE"
+     RETRY_EXIT=$?
+     if [ "$RETRY_EXIT" -eq 0 ]; then
+       echo "  → repair retry granted; node back to pending, next autopilot tick will re-execute with last_failure_context"
+       # Skip the validator chain for this tick; node is pending again.
+       # autopilot's continuous loop will pick it up on the next iteration.
+     else
+       python3 "$TREE_STATE" die <node_id> --reason "validator (final after $RETRY_EXIT retries): $FAIL_LINE" --evidence ".research-tree/branches/<node_id>/VALIDATION.json"
+     fi
+     ```
+     Done — skip to step 7. **The agent gets 2 retries with last_failure_context to learn from; after that the branch dies. Do NOT manually try a 3rd retry — the budget is the budget.**
+   - **6b.5. Validator-repair pre-pass** (v0.1.9 — cosmetic auto-fix BEFORE pass 1 final verdict). If pass 1 only failed on the cosmetic categories (charter-table rule headers using "§N" instead of "N. Canonical", DATA_MANIFEST file named with a suffix like `DATA_MANIFEST_foo.json` instead of `DATA_MANIFEST.json`, missing `requirements.txt`), run:
+        ```bash
+        python3 "$RTE_REPO/scripts/validator_repair.py" ".research-tree/branches/<node_id>" --task-type <task_type>
+        ```
+        It returns exit 0 if everything is cosmetic and got fixed, exit 2 if there are real failures it cannot repair. Re-run validator pass 1 once after a repair-0 exit. NEVER repair the underlying numeric / scientific claims — only filename / table-header / missing-env-manifest. If pass 1 STILL fails after repair, then die per 6b. The repair is a single deterministic fix, not a "try again" of the subagent.
+   - **6c. External codex audit** (v0.1.9: CLI-FIRST, MCP fallback. Always runs when 6b returned PASS).
      1. Generate a fresh challenge nonce and write it to disk. The orchestrator owns the nonce file; the subagent has never seen it:
         ```bash
         openssl rand -hex 32 > ".research-tree/branches/<node_id>/AUDIT_NONCE"
         NONCE=$(cat ".research-tree/branches/<node_id>/AUDIT_NONCE")
         ```
-     2. Invoke `mcp__codex__codex` in a FRESH thread (never codex-reply). The prompt MUST embed the nonce and demand that codex list every file it reads with its SHA256, so the validator can verify the audit was not pre-fabricated:
+     2. **PREFERRED PATH — codex CLI via `codex_audit_cli.py`** (works without MCP registration; uses the project's OPENAI_API_KEY from `~/.codex/auth.json` + GPT-5.5 at `api.biom.autos`):
+        ```bash
+        env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY \
+        python3 "$RTE_REPO/scripts/codex_audit_cli.py" \
+            --branch-dir ".research-tree/branches/<node_id>" \
+            --charter "RESEARCH_CHARTER.md" \
+            --nonce-file ".research-tree/branches/<node_id>/AUDIT_NONCE" \
+            --task-type "<task_type>" \
+            --out ".research-tree/branches/<node_id>/CODEX_AUDIT.json"
+        AUDIT_EXIT=$?
+        ```
+        If `AUDIT_EXIT == 0`, the CLI already wrote a validator-compliant CODEX_AUDIT.json with nonce echo + per-file SHA256s. Proceed to step 6d.
+     3. **FALLBACK PATH — `mcp__codex__codex`** (only if the CLI exit != 0 AND the tool is registered). Invoke in a FRESH thread (never codex-reply). The prompt MUST embed the nonce and demand that codex list every file it reads with its SHA256, so the validator can verify the audit was not pre-fabricated:
         ```
         You are an external adversarial auditor for a research branch. Your job is
         to read the artifacts on disk and decide whether the branch genuinely meets
@@ -498,6 +579,49 @@ python3 "$SYNTHESIZE" --project-root "$(pwd)"
 
 Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights to the user in one paragraph. The full report is on disk.
 
+### step (v0.2.1 — interactive co-pilot, NOT silent/continuous)
+
+Single autopilot step + explicit "what next?" suggestions for Lily. Differs from `autopilot` in two ways: (1) always chatty (never silent), (2) ends with a structured suggestion list so she can pick the next move instead of letting silent autopilot decide.
+
+```bash
+# 1. Run one autopilot step (use the autopilot section logic, NOT --silent NOT --continuous)
+# All the validation chain / cascade-reap / agent-fork-handling still applies.
+# At the END of that single step, do NOT just stop — also:
+python3 "$TREE_STATE" --project-root "$(pwd)" suggest-next > /tmp/rt_suggest_$$.json
+```
+
+After the step completes (success or branch died), present to Lily:
+- ASCII tree (first 15 lines of `tree_state.py tree`)
+- One-paragraph "what changed this step" (which node ran, what verdict)
+- Top 3-5 suggestions from `suggest-next` JSON, formatted as a clickable list:
+  ```
+  Next moves (you pick):
+    1. deepen 1.2 — head-to-head with completed 1.1 (sibling)
+    2. expand 1.4 — completed 1.1 unlocked dependents (deepen)
+    3. backtrack 1.3 — set aside, try sibling first
+  Reply with the option number (or `step` for autopilot's choice).
+  ```
+
+STOP and wait for Lily. **No /loop wrap on `step`** — it's explicitly the "one step, talk to me" mode.
+
+### backtrack <node_id> (v0.2.1)
+
+Lily reviewed a branch result, doesn't want to kill it but wants to park it:
+```bash
+python3 "$TREE_STATE" --project-root "$(pwd)" backtrack "$NODE_ID" --reason "Lily wants to try sibling first"
+```
+Output the new tree (head 15 lines). One-line confirmation: "Node X parked (status=abandoned). Sibling siblings or other paths can proceed."
+
+Differs from `prune`: `prune` calls `die` (counted in dead atlas, downstream cascades may reap). `backtrack` is reversible, no death record, no cascade.
+
+### resume-branch <node_id> (v0.2.1)
+
+Counterpart to backtrack. Un-park an abandoned node:
+```bash
+python3 "$TREE_STATE" --project-root "$(pwd)" resume-branch "$NODE_ID"
+```
+Output one-line: "Node X back to pending; next pick-next may select it."
+
 ### autopilot / resume
 
 **`autopilot` is a single-step command, not a long-running loop.** Each invocation does ONE unit of work and returns. To run continuously, the user wraps it with the external `/loop` skill, e.g. `/loop 30m /research-tree autopilot`. This keeps your main context fresh — each step is one orchestration turn, heavy work is in subagents, no in-prompt for-loops that bloat over time.
@@ -579,6 +703,17 @@ A single autopilot step does this:
      for each node in `alive`:
          # process still running, leave alone; pick-next won't pick it.
          log "node <id> still running pid=<pid> since <started_at>"
+
+1.7. **Cascade-reap zombies** (v0.1.9 — prevents whole-subtree zombie-lock).
+     A single cosmetic failure on a parent used to leave dependents stuck in
+     `pending` forever, because `_deps_satisfied` only accepts `completed`,
+     not `dead`. cascade-reap walks the tree and converts those zombie-pending
+     dependents to `dead` with reason `parent_dep_died:<id>`:
+     ```bash
+     python3 "$TREE_STATE" --project-root "$(pwd)" cascade-reap > /tmp/rte_reap_$$.json
+     ```
+     If the JSON `count > 0`, log it to progress.log so the user can see what
+     got swept. Do NOT die over this — cascade-reap is housekeeping, not failure.
 
 2. Check for previously-detected terminal states (FIRST TIME ONLY — repeats
    are caught by Step 0's human-gate fast-exit so we don't re-surface them
@@ -704,9 +839,13 @@ A single autopilot step does this:
      so the message is delivered exactly once and subsequent /loop ticks are
      free.
 
-11.5. **Session counter check** (v0.1.5; v0.1.8 raises human-gate automatically):
+11.5. **Session counter check** (v0.1.5; v0.1.8 raises human-gate automatically;
+     v0.1.9 silent mode raises threshold to 80 via env var):
      ```bash
-     python3 "$TREE_STATE" session-step increment --threshold 10 > /tmp/rte_session_$$.json
+     # v0.1.9 — pass RESEARCH_TREE_SILENT=1 when invoking from `autopilot --silent`
+     # so the threshold default flips from 10 → 80 (≈ 40 hours unattended capacity).
+     if [[ "$AUTOPILOT_MODE" == *silent* ]]; then export RESEARCH_TREE_SILENT=1; fi
+     python3 "$TREE_STATE" session-step increment > /tmp/rte_session_$$.json
      SESSION_EXIT=$?
      ```
      If `SESSION_EXIT != 0` (i.e., `should_pause: true`), the session has accumulated
