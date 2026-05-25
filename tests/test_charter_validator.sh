@@ -20,10 +20,14 @@ build_perfect_branch() {
         "$DIR/ablations/cross_batch"
 
     # Held-out test set
+    # v0.3.1: validator now recomputes hash from sorted(test_ids); fixture must
+    # provide the real hash. sha256(json.dumps(sorted(ids), separators=(',', ':')))
+    local SPLIT_HASH
+    SPLIT_HASH=$(python3 -c 'import hashlib, json; print(hashlib.sha256(json.dumps(sorted(["cell_001","cell_002","cell_003"]), separators=(",", ":")).encode()).hexdigest())')
     cat > "$DIR/data/test_split.json" <<EOF
 {
   "test_ids": ["cell_001", "cell_002", "cell_003"],
-  "hash": "sha256:deadbeef",
+  "hash": "$SPLIT_HASH",
   "created_at": "2026-05-23T10:00:00Z",
   "fraction": 0.2
 }
@@ -212,13 +216,38 @@ cat > "$B/CODEX_AUDIT.json" <<EOF
 EOF
 expect_exit "codex verdict=FAIL fails when required" 2 "$B" --require-codex-audit
 
-echo "=== test 16: --require-codex-audit + verdict=PASS passes ==="
-B="$TMP/audit_pass"
+echo "=== test 16: --require-codex-audit needs nonce path (v0.3.1) ==="
+# v0.3.1 (codex review P0-3): --require-codex-audit without nonce file used to
+# silently skip the SHA cross-check. Now it FAILs — caller must pass
+# --audit-nonce-file OR put AUDIT_NONCE inside the branch.
+B="$TMP/audit_no_nonce"
 build_perfect_branch "$B"
 cat > "$B/CODEX_AUDIT.json" <<EOF
 {"verdict": "PASS", "reasoning_summary": "Honest, well-instrumented branch."}
 EOF
-expect_exit "codex verdict=PASS still passes overall" 0 "$B" --require-codex-audit
+expect_exit "codex audit without nonce now FAILs" 2 "$B" --require-codex-audit
+
+echo "=== test 16b: --require-codex-audit + nonce + sha cross-check passes ==="
+B="$TMP/audit_pass"
+build_perfect_branch "$B"
+NONCE16="real-nonce-test16b"
+echo "$NONCE16" > "$B/AUDIT_NONCE"
+RESULT_SHA=$(sha256sum "$B/RESULT.md" | awk '{print $1}')
+METRICS_SHA=$(sha256sum "$B/metrics.json" | awk '{print $1}')
+SPLIT_SHA=$(sha256sum "$B/data/test_split.json" | awk '{print $1}')
+cat > "$B/CODEX_AUDIT.json" <<EOF
+{
+  "nonce": "$NONCE16",
+  "verdict": "PASS",
+  "reasoning_summary": "Honest, well-instrumented branch.",
+  "files_read": {
+    "RESULT.md": "$RESULT_SHA",
+    "metrics.json": "$METRICS_SHA",
+    "data/test_split.json": "$SPLIT_SHA"
+  }
+}
+EOF
+expect_exit "codex verdict=PASS with nonce + sha cross-check passes" 0 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
 
 echo "=== test 17: DONE_READY=true + missing KILL_ARGUMENT.md fails ==="
 B="$TMP/done_no_kill"

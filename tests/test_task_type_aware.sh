@@ -204,11 +204,14 @@ EOF
 echo "cellxgene_census>=1.10" > "$TMP/branch_data/requirements.txt"
 mkdir -p "$TMP/branch_data/data"
 echo "fake h5ad bytes for test" > "$TMP/branch_data/data/schulte.h5ad"
+# v0.3.1: validator now recomputes sha256 of local_path and cross-checks; fake
+# checksum no longer passes. Compute the real hash.
+REAL_CKSUM=$(sha256sum "$TMP/branch_data/data/schulte.h5ad" | awk '{print $1}')
 cat > "$TMP/branch_data/DATA_MANIFEST.json" <<EOF
 {"atlas_id": "schulte_2020_covid",
  "source_url": "https://cellxgene.cziscience.com/...",
  "local_path": "data/schulte.h5ad",
- "checksum": "sha256:fake_for_test",
+ "checksum": "$REAL_CKSUM",
  "n_cells": 165847,
  "downloaded_at": "2026-05-23T15:00:00Z"}
 EOF

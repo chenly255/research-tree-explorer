@@ -2,6 +2,93 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.1] — 2026-05-25
+
+Trust-kernel hardening + race condition fixes from a Linus-style code review
+of the tool by Claude, followed by an independent codex blind audit that
+caught 4 holes Claude missed (including 2 trust-kernel bypasses). The codex
+audit pattern — Claude reviews, codex reviews Claude's review — is now
+recommended practice for tool changes since AI-written code reviewed by the
+same AI inherits the same blind spots.
+
+### Fixed — trust kernel (P0 from codex review)
+- **`cmd_complete` no longer accepts user-supplied JSON as proof** (codex P0-1).
+  Previously any path with `{"verdict":"PASS"}` could mark a node completed.
+  v0.3.1 ignores `--validator-report` and re-runs `charter_validator.py` as a
+  subprocess against the node's `branch_dir`. Trust source is fresh validator
+  stdout, not a path the agent chose. The flag is retained as deprecated for
+  backward compat but does nothing.
+- **`--require-codex-audit` now requires a nonce file** (codex P0-3).
+  Previously `--require-codex-audit` without `--audit-nonce-file` silently
+  skipped the entire nonce+SHA256 cross-check (the actual anti-fabrication
+  layer), so any CODEX_AUDIT.json with `verdict: PASS` would slip through.
+  v0.3.1 falls back to `branch_dir/AUDIT_NONCE` if `--audit-nonce-file` is
+  absent and FAILs if neither exists.
+- **`test_split.json` hash is now recomputed**, not just checked for field
+  existence (codex P1-2). `sha256(json.dumps(sorted(test_ids),
+  separators=(',', ':')))` must match the `hash` field. Same for
+  `DATA_MANIFEST.json` `checksum` — actual file SHA256 is recomputed and
+  cross-checked instead of accepting any string.
+- **`codex_audit_cli.py` no longer silently truncates oversized files**
+  (codex P1-3, partial fix). Truncation let the model SHA-echo content it
+  only half-saw. Files > 12000 bytes now hard-fail with a clear message.
+  Full fix (challenge-fragment instead of SHA-echo) is a v0.3.2 design note.
+
+### Fixed — concurrency + counter (P0 from Linus review)
+- **`cmd_apply_subtree_fork`, `cmd_cascade_reap`, `cmd_repair_retry` now hold
+  `state_lock`** (Linus P0). Previously these three mutate paths read +
+  modified + saved `tree.json` without the flock — concurrent `/loop` ticks
+  could race-overwrite each other's state.
+- **`state["stats"]` counters now stay consistent across all status
+  transitions** (Linus P0). `cmd_backtrack`, `cmd_resume_branch`,
+  `cmd_cascade_reap`, `cmd_apply_subtree_fork` were updating `status` field
+  directly, bypassing `_apply_status_transition` — alive/dead/completed
+  counts drifted from reality the moment any of these commands ran.
+
+### Fixed — other (P1 from both reviews)
+- **`cmd_apply_subtree_fork` now enforces `max_depth` / `max_branches_per_junction`
+  / `max_total_nodes`** (codex P1-5). The comment claimed "same code path as
+  add" was wrong — agent self-forks were entirely outside the budget.
+- **`stale_running_handler` records and cross-checks process start time**
+  (codex P1-4). `kill(pid, 0)` alone treated zombies as alive and missed PID
+  reuse. EXECUTOR.json now persists `pid_starttime` (Linux clock-ticks-since-boot
+  from `/proc/<pid>/stat`); subsequent checks confirm the same starttime.
+- **`state_lock` opens lockfile with `O_NOFOLLOW`** (codex P2-3). A symlink at
+  `tree.lock` pointing to e.g. `tree.json` would have let the old
+  `open("w")` truncate the linked target.
+
+### Removed — YAGNI cleanup (Linus review)
+- Node fields `agent_capable` (never read), `max_repair_attempts` (never set
+  per-node — demoted to module constant `MAX_REPAIR_ATTEMPTS=2`),
+  `subtree_origin` (never branched on). Smaller schema, smaller cognitive load.
+- `cmd_add` CLI flag `--subtree-origin` (removed with the field).
+
+### Refactored
+- New `_build_new_node()` factory used by both `cmd_add` and
+  `cmd_apply_subtree_fork`. Previously the two call sites had near-identical
+  27-line dict literals that drifted apart whenever v0.2 / v0.3 added fields.
+
+### Known limitations (deferred to v0.3.2)
+- `codex_audit_cli.py` SHA echo proves "the prompt orchestrator built matches
+  what the validator re-hashes from disk" but does NOT prove the LLM actually
+  read the inlined bytes. The proper fix is a challenge-fragment scheme (model
+  must quote text at a random offset). v0.3.1 mitigates only by rejecting
+  oversized files instead of silent middle-truncation.
+- `forked` / `abandoned` statuses still exist as a separate sub-status surface
+  with no behavioral distinction from `expanded` / `pending` + a flag —
+  consolidation is deferred.
+- Same-session detection still walks `/proc/<pid>/status` PPid chain (Linux-only);
+  could be replaced with a `$RESEARCH_TREE_SESSION_ID` env var.
+
+### Tests
+- All 6 test suites pass (`test_tree_state.sh`, `test_charter_validator.sh`,
+  `test_task_type_aware.sh`, `test_data_acquisition.sh`, `test_signal_detector.sh`,
+  `test_stale_running_handler.sh`). Fixtures updated:
+  - `test_charter_validator.sh` test 1, 16 → use real sha256(test_ids)
+  - `test_task_type_aware.sh` test 18 → use real sha256(local file)
+  - `test_signal_detector.sh` fixture nodes → `parent` not `parent_id` (was
+    a pre-existing bug uncovered while running the full suite)
+
 ## [0.1.8] — 2026-05-25
 
 Token-saving rework triggered by the sc-bias session-cap failure mode: every

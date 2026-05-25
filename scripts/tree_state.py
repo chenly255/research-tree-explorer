@@ -114,6 +114,11 @@ SET_ALLOWED_KEYS = {
 DEFAULT_SESSION_STEP_THRESHOLD = 10
 SILENT_SESSION_STEP_THRESHOLD = 80
 
+# v0.3.1 — was a node field, demoted to constant (codex review P2-2 + Linus
+# review YAGNI). No node ever set a non-default value; the field was just
+# auth pretending to allow per-node tuning that nothing called.
+MAX_REPAIR_ATTEMPTS = 2
+
 
 def state_path(root: Path) -> Path:
     return root / STATE_DIR_NAME / STATE_FILE_NAME
@@ -141,16 +146,33 @@ def state_lock(root: Path) -> Iterator[None]:
 
     Prevents two concurrent autopilot processes (or accidental parallel CLI runs)
     from corrupting tree.json or producing duplicate IDs.
+
+    v0.3.1 (codex review P2-3): O_NOFOLLOW so a symlink at tree.lock doesn't let
+    `open("w")` truncate the linked target. Also O_RDWR | O_CREAT — we don't
+    need the truncate behavior of `open(p, "w")` since the lockfile content is
+    never read; we only need an fd to flock.
     """
     lp = lock_path(root)
     lp.parent.mkdir(parents=True, exist_ok=True)
-    fp = open(lp, "w")
     try:
-        fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        fd = os.open(
+            str(lp),
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as e:
+        sys.exit(
+            f"ERROR: cannot open lockfile {lp}: {e}. "
+            f"If {lp} is a symlink, remove it — lockfile must not follow symlinks."
+        )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
-        fp.close()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def load_state(root: Path) -> dict[str, Any]:
@@ -180,6 +202,49 @@ def save_state(root: Path, state: dict[str, Any]) -> None:
     with tmp.open("w") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
     tmp.replace(p)
+
+
+def _build_new_node(
+    *,
+    new_id: str,
+    parent_id: str,
+    depth: int,
+    kind: str,
+    title: str,
+    description: str,
+    task_type: str,
+    depends_on: list[str],
+    human_only: bool,
+    spawned_by_agent: str | None = None,
+) -> dict[str, Any]:
+    """v0.3.1 — single source of truth for new-node schema. Both cmd_add and
+    cmd_apply_subtree_fork call this so we don't have two parallel field
+    constructors that drift apart when fields are added/removed.
+    """
+    return {
+        "id": new_id,
+        "parent": parent_id,
+        "depth": depth,
+        "kind": kind,
+        "status": "pending",
+        "title": title[:200],
+        "description": description,
+        "score": None,
+        "death_reason": None,
+        "death_evidence": None,
+        "completion_proof": None,
+        "junction_audit_id": None,
+        "branch_dir": f"{STATE_DIR_NAME}/branches/{new_id}",
+        "children": [],
+        "direct_executable": False,
+        "task_type": task_type,
+        "depends_on": depends_on,
+        "human_only": human_only,
+        "repair_attempts": 0,
+        "last_failure_context": None,
+        "spawned_by_agent": spawned_by_agent,
+        "created_at": now_iso(),
+    }
 
 
 def next_id(state: dict[str, Any], parent: str) -> str:
@@ -307,37 +372,18 @@ def cmd_add(args) -> None:
             sys.exit(f"ERROR: would exceed max_total_nodes ({constraints['max_total_nodes']}).")
 
         new_id = next_id(state, parent_id)
-        new_node = {
-            "id": new_id,
-            "parent": parent_id,
-            "depth": parent_node["depth"] + 1,
-            "kind": args.kind,
-            "status": "pending",
-            "title": args.title,
-            "description": args.description or args.title,
-            "score": None,
-            "death_reason": None,
-            "death_evidence": None,
-            "completion_proof": None,
-            "junction_audit_id": None,
-            "branch_dir": f"{STATE_DIR_NAME}/branches/{new_id}",
-            "children": [],
-            "direct_executable": False,
-            # v0.1.6 — task-type-aware fields
-            "task_type": task_type,
-            "depends_on": depends_on,
-            "human_only": human_only,
-            # v0.2.0 — agent-driven branch fields. Default to agent-capable so
-            # new nodes can take advantage of the agent execute mode without
-            # explicit opt-in. Set agent_capable=false to force script-only mode.
-            "agent_capable": True,
-            "repair_attempts": 0,
-            "max_repair_attempts": 2,
-            "last_failure_context": None,
-            "spawned_by_agent": getattr(args, "spawned_by_agent", None),
-            "subtree_origin": getattr(args, "subtree_origin", "orchestrator"),
-            "created_at": now_iso(),
-        }
+        new_node = _build_new_node(
+            new_id=new_id,
+            parent_id=parent_id,
+            depth=parent_node["depth"] + 1,
+            kind=args.kind,
+            title=args.title,
+            description=args.description or args.title,
+            task_type=task_type,
+            depends_on=depends_on,
+            human_only=human_only,
+            spawned_by_agent=getattr(args, "spawned_by_agent", None),
+        )
         state["nodes"][new_id] = new_node
         parent_node["children"].append(new_id)
         if parent_node["status"] == "pending":
@@ -460,25 +506,69 @@ def cmd_running(args) -> None:
 
 
 def cmd_complete(args) -> None:
-    """Mark a node completed. Requires a PASSING validator report to prevent
-    lazy subagents from bypassing the validator chain with raw `set status=completed`.
-    The validator report's SHA256 is recorded as completion_proof for audit.
+    """Mark a node completed. v0.3.1 — trust kernel hardening (codex review P0-1):
+    no longer accepts arbitrary user-supplied JSON as proof. This function
+    invokes `charter_validator.py` as a subprocess against the node's actual
+    `branch_dir` and trusts ONLY validator stdout. Any user-supplied report
+    path is rejected; the only way to mark a node completed is to have real
+    artifacts on disk that the validator approves.
     """
+    import subprocess
     root = Path(args.project_root).resolve()
-    report_path = Path(args.validator_report).resolve()
-    if not report_path.exists():
-        sys.exit(f"ERROR: validator report not found at {report_path}")
-    try:
-        report = json.loads(report_path.read_text())
-    except json.JSONDecodeError as e:
-        sys.exit(f"ERROR: validator report is not valid JSON: {e}")
-    verdict = report.get("verdict", "").upper()
-    if verdict != "PASS":
+
+    # Need node info to find branch_dir + task_type
+    state = load_state(root)
+    if args.node_id not in state["nodes"]:
+        sys.exit(f"ERROR: node {args.node_id!r} not found.")
+    node = state["nodes"][args.node_id]
+    branch_dir = root / node["branch_dir"]
+    if not branch_dir.is_dir():
+        sys.exit(f"ERROR: branch_dir {branch_dir} does not exist on disk")
+    task_type = node.get("task_type", "training")
+
+    # Locate validator script — same directory as this file
+    validator_path = Path(__file__).resolve().parent / "charter_validator.py"
+    if not validator_path.exists():
+        sys.exit(f"ERROR: charter_validator.py not found at {validator_path}")
+
+    # Optional audit nonce — if provided, validator will enforce codex audit
+    val_cmd = [
+        sys.executable, str(validator_path), str(branch_dir),
+        "--task-type", task_type,
+    ]
+    if args.audit_nonce_file:
+        nonce_path = Path(args.audit_nonce_file).resolve()
+        if not nonce_path.exists():
+            sys.exit(f"ERROR: --audit-nonce-file {nonce_path} not found")
+        val_cmd += ["--require-codex-audit", "--audit-nonce-file", str(nonce_path)]
+    elif args.require_codex_audit:
         sys.exit(
-            f"ERROR: validator verdict={verdict!r} — only PASS reports can mark a node completed. "
-            f"For WARN or FAIL, use `die` with the reason."
+            "ERROR: --require-codex-audit was passed but no --audit-nonce-file. "
+            "Pass the AUDIT_NONCE file produced before the codex call, or drop both flags."
         )
-    proof_sha = sha256_file(report_path)
+
+    # Run validator fresh — this is the trust source
+    proc = subprocess.run(val_cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(
+            f"ERROR: charter_validator returned {proc.returncode} for {branch_dir}; "
+            f"refusing to mark completed. See stderr above for failures."
+        )
+    try:
+        report = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: validator stdout was not valid JSON: {e}\n{proc.stdout[:500]}")
+    if report.get("verdict", "").upper() != "PASS":
+        sys.exit(
+            f"ERROR: validator verdict={report.get('verdict')!r} — only PASS marks a node completed."
+        )
+
+    # Persist the validated report into the branch_dir so audit can reconstruct.
+    # The SHA256 of THIS file is the completion proof.
+    saved_report = branch_dir / "VALIDATION.json"
+    saved_report.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    proof_sha = sha256_file(saved_report)
 
     with state_lock(root):
         state = load_state(root)
@@ -488,9 +578,11 @@ def cmd_complete(args) -> None:
         _apply_status_transition(state, node, "completed")
         node["score"] = args.score
         node["completion_proof"] = {
-            "validator_report": str(report_path),
+            "validator_report": str(saved_report),
             "validator_report_sha256": proof_sha,
             "validator_verdict": "PASS",
+            "validator_invocation": "subprocess",
+            "validator_invoked_by": "tree_state.cmd_complete",
             "completed_at": now_iso(),
         }
         if args.done_ready:
@@ -562,7 +654,7 @@ def cmd_backtrack(args) -> None:
                 f"ERROR: cannot backtrack from status {node['status']!r}; "
                 f"only pending/running/expanded/forked may be set aside."
             )
-        node["status"] = "abandoned"
+        _apply_status_transition(state, node, "abandoned")
         if args.reason:
             node["abandon_reason"] = args.reason
         node["updated_at"] = now_iso()
@@ -583,7 +675,7 @@ def cmd_resume_branch(args) -> None:
                 f"ERROR: resume-branch only works on abandoned nodes; "
                 f"current status is {node['status']!r}."
             )
-        node["status"] = "pending"
+        _apply_status_transition(state, node, "pending")
         node.pop("abandon_reason", None)
         node["updated_at"] = now_iso()
         save_state(root, state)
@@ -790,31 +882,32 @@ def cmd_repair_retry(args) -> None:
     Exit code 0 if retry granted, 2 if exhausted (caller should die the node).
     """
     root = Path(args.project_root or ".").resolve()
-    state = load_state(root)
-    if args.node_id not in state["nodes"]:
-        sys.exit(f"ERROR: node {args.node_id} not in tree")
-    node = state["nodes"][args.node_id]
-    if node["status"] not in ("running", "pending", "expanded"):
-        sys.exit(
-            f"ERROR: cannot retry node in status {node['status']!r}; "
-            f"retry only valid for running/pending/expanded."
-        )
-    current_attempts = int(node.get("repair_attempts", 0))
-    max_attempts = int(node.get("max_repair_attempts", 2))
-    if current_attempts >= max_attempts:
-        print(json.dumps({
-            "node_id": args.node_id,
-            "repair_attempts": current_attempts,
-            "max_repair_attempts": max_attempts,
-            "allowed_more_retries": False,
-            "advice": "retry budget exhausted; caller should die this node",
-        }, indent=2))
-        return 2
-    node["repair_attempts"] = current_attempts + 1
-    node["last_failure_context"] = args.failure_context
-    node["status"] = "pending"
-    node["updated_at"] = now_iso()
-    save_state(root, state)
+    with state_lock(root):
+        state = load_state(root)
+        if args.node_id not in state["nodes"]:
+            sys.exit(f"ERROR: node {args.node_id} not in tree")
+        node = state["nodes"][args.node_id]
+        if node["status"] not in ("running", "pending", "expanded"):
+            sys.exit(
+                f"ERROR: cannot retry node in status {node['status']!r}; "
+                f"retry only valid for running/pending/expanded."
+            )
+        current_attempts = int(node.get("repair_attempts", 0))
+        max_attempts = MAX_REPAIR_ATTEMPTS
+        if current_attempts >= max_attempts:
+            print(json.dumps({
+                "node_id": args.node_id,
+                "repair_attempts": current_attempts,
+                "max_repair_attempts": max_attempts,
+                "allowed_more_retries": False,
+                "advice": "retry budget exhausted; caller should die this node",
+            }, indent=2))
+            return 2
+        node["repair_attempts"] = current_attempts + 1
+        node["last_failure_context"] = args.failure_context
+        _apply_status_transition(state, node, "pending")
+        node["updated_at"] = now_iso()
+        save_state(root, state)
     print(json.dumps({
         "node_id": args.node_id,
         "repair_attempts": node["repair_attempts"],
@@ -847,14 +940,19 @@ def cmd_apply_subtree_fork(args) -> None:
     Exit 0 on success, 2 on parse / validation error.
     """
     root = Path(args.project_root or ".").resolve()
-    state = load_state(root)
-    if args.node_id not in state["nodes"]:
-        sys.exit(f"ERROR: node {args.node_id} not in tree")
-    parent = state["nodes"][args.node_id]
-    if parent["status"] not in ("running", "pending"):
-        sys.exit(
-            f"ERROR: can only fork from a running/pending node, got {parent['status']!r}"
-        )
+    with state_lock(root):
+        state = load_state(root)
+        if args.node_id not in state["nodes"]:
+            sys.exit(f"ERROR: node {args.node_id} not in tree")
+        parent = state["nodes"][args.node_id]
+        if parent["status"] not in ("running", "pending"):
+            sys.exit(
+                f"ERROR: can only fork from a running/pending node, got {parent['status']!r}"
+            )
+        return _do_apply_subtree_fork(args, root, state, parent)
+
+
+def _do_apply_subtree_fork(args, root: Path, state: dict, parent: dict) -> None:
     fork_path = root / STATE_DIR_NAME / "branches" / args.node_id / "SUBTREE_FORK.md"
     if not fork_path.exists():
         sys.exit(f"ERROR: SUBTREE_FORK.md not found at {fork_path}")
@@ -875,6 +973,33 @@ def cmd_apply_subtree_fork(args) -> None:
     if len(candidates) > 4:
         sys.exit(f"ERROR: SUBTREE_FORK.md proposes {len(candidates)} candidates; max 4")
 
+    # v0.3.1 (codex review P1-5): enforce same budget checks as cmd_add, even
+    # though the comment used to claim "same code path as add". It wasn't.
+    constraints = state["global_constraints"]
+    parent_depth = parent["depth"]
+    if parent_depth + 1 > constraints["max_depth"]:
+        sys.exit(
+            f"ERROR: SUBTREE_FORK would create children at depth {parent_depth + 1} "
+            f"exceeding max_depth={constraints['max_depth']}"
+        )
+    alive_children_already = [
+        c for c in parent["children"]
+        if state["nodes"][c]["status"] != "dead"
+    ]
+    headroom_branches = constraints["max_branches_per_junction"] - len(alive_children_already)
+    if len(candidates) > headroom_branches:
+        sys.exit(
+            f"ERROR: SUBTREE_FORK proposes {len(candidates)} candidates but parent "
+            f"{args.node_id} only has headroom {headroom_branches} (alive children "
+            f"{len(alive_children_already)} of max {constraints['max_branches_per_junction']})."
+        )
+    if state["stats"]["nodes_total"] + len(candidates) > constraints["max_total_nodes"]:
+        sys.exit(
+            f"ERROR: SUBTREE_FORK would push total nodes from {state['stats']['nodes_total']} "
+            f"to {state['stats']['nodes_total'] + len(candidates)}, exceeding "
+            f"max_total_nodes={constraints['max_total_nodes']}"
+        )
+
     # Two-pass add (same pattern as expand): assign real ids first, then patch deps
     placeholder_to_id: dict[str, str] = {}
     added_ids: list[str] = []
@@ -886,36 +1011,22 @@ def cmd_apply_subtree_fork(args) -> None:
         if task_type not in VALID_TASK_TYPES:
             sys.exit(f"ERROR: candidate task_type {task_type!r} not in {sorted(VALID_TASK_TYPES)}")
         new_id = next_id(state, args.node_id)
-        new_node = {
-            "id": new_id,
-            "parent": args.node_id,
-            "depth": parent["depth"] + 1,
-            "kind": kind,
-            "status": "pending",
-            "title": c.get("title", "")[:200],
-            "description": c.get("description", c.get("title", "")),
-            "score": None,
-            "death_reason": None,
-            "death_evidence": None,
-            "completion_proof": None,
-            "junction_audit_id": None,
-            "branch_dir": f"{STATE_DIR_NAME}/branches/{new_id}",
-            "children": [],
-            "direct_executable": False,
-            "task_type": task_type,
-            "depends_on": [],
-            "human_only": bool(c.get("human_only", False)),
-            "agent_capable": True,
-            "repair_attempts": 0,
-            "max_repair_attempts": 2,
-            "last_failure_context": None,
-            "spawned_by_agent": args.node_id,
-            "subtree_origin": "agent_fork",
-            "created_at": now_iso(),
-        }
+        new_node = _build_new_node(
+            new_id=new_id,
+            parent_id=args.node_id,
+            depth=parent["depth"] + 1,
+            kind=kind,
+            title=c.get("title", ""),
+            description=c.get("description", c.get("title", "")),
+            task_type=task_type,
+            depends_on=[],
+            human_only=bool(c.get("human_only", False)),
+            spawned_by_agent=args.node_id,
+        )
         state["nodes"][new_id] = new_node
         parent["children"].append(new_id)
         state["stats"]["nodes_total"] += 1
+        state["stats"]["nodes_alive"] += 1
         # create branch_dir on disk so executor can write into it
         Path(root / new_node["branch_dir"]).mkdir(parents=True, exist_ok=True)
         placeholder = c.get("placeholder_id", new_id)
@@ -941,7 +1052,7 @@ def cmd_apply_subtree_fork(args) -> None:
         state["nodes"][new_id]["depends_on"] = resolved
 
     # Mark parent as forked (new v0.2.0 status — distinct from orchestrator expanded)
-    parent["status"] = "forked"
+    _apply_status_transition(state, parent, "forked")
     parent["updated_at"] = now_iso()
     save_state(root, state)
     print(json.dumps({
@@ -961,21 +1072,22 @@ def cmd_cascade_reap(args) -> None:
     before pick-next). Outputs JSON list of newly-reaped node ids.
     """
     root = Path(args.project_root or ".").resolve()
-    state = load_state(root)
-    reaped: list[dict[str, str]] = []
-    for nid, node in state["nodes"].items():
-        if node.get("status") != "pending":
-            continue
-        dead_dep = _dep_has_dead_in_chain(state, node)
-        if dead_dep is None:
-            continue
-        node["status"] = "dead"
-        node["death_reason"] = f"parent_dep_died:{dead_dep}"
-        node["death_evidence"] = None
-        node["updated_at"] = now_iso()
-        reaped.append({"node_id": nid, "killed_by_dep": dead_dep})
-    if reaped:
-        save_state(root, state)
+    with state_lock(root):
+        state = load_state(root)
+        reaped: list[dict[str, str]] = []
+        for nid, node in state["nodes"].items():
+            if node.get("status") != "pending":
+                continue
+            dead_dep = _dep_has_dead_in_chain(state, node)
+            if dead_dep is None:
+                continue
+            _apply_status_transition(state, node, "dead")
+            node["death_reason"] = f"parent_dep_died:{dead_dep}"
+            node["death_evidence"] = None
+            node["updated_at"] = now_iso()
+            reaped.append({"node_id": nid, "killed_by_dep": dead_dep})
+        if reaped:
+            save_state(root, state)
     print(json.dumps({"reaped": reaped, "count": len(reaped)}, indent=2))
 
 
@@ -1374,15 +1486,10 @@ def main() -> None:
     )
     # v0.2.0 — agent fork lineage tracking. Set by cmd_apply_subtree_fork when
     # an agent decided to fork its own subtree; not normally used directly.
+    # v0.3.1 — removed --subtree-origin (was never read).
     p_add.add_argument(
         "--spawned-by-agent", default=None,
         help="node_id of the agent that decided to spawn this child (v0.2.0)",
-    )
-    p_add.add_argument(
-        "--subtree-origin",
-        default="orchestrator",
-        choices=("orchestrator", "agent_fork", "repair_retry"),
-        help="who created this node — orchestrator expand, agent self-fork, or repair retry",
     )
     p_add.set_defaults(func=cmd_add)
 
@@ -1400,15 +1507,28 @@ def main() -> None:
 
     p_complete = sub.add_parser(
         "complete",
-        help="mark a node completed (requires PASSING validator report)",
+        help="mark a node completed (v0.3.1: re-runs charter_validator on branch_dir; "
+             "trusts only fresh validator stdout, not user-supplied JSON)",
     )
     p_complete.add_argument("node_id")
     p_complete.add_argument(
         "--validator-report",
-        required=True,
-        help="path to charter_validator.py JSON output; must contain verdict=PASS",
+        default=None,
+        help="DEPRECATED in v0.3.1 — ignored. Validator is always re-run from "
+             "branch_dir as the trust source.",
     )
     p_complete.add_argument("--score", type=float, required=True)
+    p_complete.add_argument(
+        "--audit-nonce-file",
+        default=None,
+        help="if provided, pass to charter_validator as --audit-nonce-file (enforces "
+             "codex audit nonce + SHA256 cross-check).",
+    )
+    p_complete.add_argument(
+        "--require-codex-audit",
+        action="store_true",
+        help="require codex audit; must be paired with --audit-nonce-file.",
+    )
     p_complete.add_argument(
         "--done-ready",
         action="store_true",

@@ -236,7 +236,14 @@ def check_result_md(
 
 
 def check_data_rules(branch_dir: Path, failures: list, evidence: dict) -> None:
-    """Charter §1: held-out test set with hash, no leakage."""
+    """Charter §1: held-out test set with hash, no leakage.
+
+    v0.3.1 (codex review P1-2): not enough to check the `hash` field exists;
+    we must recompute it from `test_ids` and confirm. Otherwise a subagent can
+    write `"hash": "fakebeef"` and it counts. Recompute rule:
+        sha256(json.dumps(sorted(test_ids), separators=(',', ':')).encode())
+    Reproducible, sort-stable, agnostic to JSON whitespace.
+    """
     test_split = branch_dir / "data" / "test_split.json"
     if not check_file_exists(test_split, "data/test_split.json", failures):
         return
@@ -250,9 +257,23 @@ def check_data_rules(branch_dir: Path, failures: list, evidence: dict) -> None:
     for key in ("test_ids", "hash", "created_at"):
         if key not in meta:
             failures.append(f"data/test_split.json: missing required key '{key}'")
+    test_ids = meta.get("test_ids")
     # test_ids must be non-empty list
-    if isinstance(meta.get("test_ids"), list) and len(meta["test_ids"]) == 0:
+    if isinstance(test_ids, list) and len(test_ids) == 0:
         failures.append("data/test_split.json: 'test_ids' is empty")
+    # v0.3.1 — actually recompute hash from test_ids and cross-check
+    claimed_hash = meta.get("hash")
+    if isinstance(test_ids, list) and isinstance(claimed_hash, str) and claimed_hash:
+        canonical = json.dumps(sorted(map(str, test_ids)), separators=(",", ":")).encode()
+        computed_hash = hashlib.sha256(canonical).hexdigest()
+        evidence["test_split"]["claimed_hash"] = claimed_hash
+        evidence["test_split"]["computed_hash"] = computed_hash
+        if claimed_hash != computed_hash:
+            failures.append(
+                f"data/test_split.json: hash mismatch — claimed {claimed_hash!r}, "
+                f"sha256(sorted(test_ids))={computed_hash!r}. Field-existence check "
+                f"is not enough; the hash must actually reproduce."
+            )
 
 
 def check_training_rules(branch_dir: Path, failures: list, evidence: dict) -> dict[str, int]:
@@ -453,52 +474,69 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
         failures.append(f"CODEX_AUDIT.json: external verdict={verdict or 'MISSING'}. Reason: {reasoning}")
         return  # no point checking nonce/files if it already failed
 
-    # Nonce check — only enforced if --audit-nonce-file was passed
-    if nonce_path is not None:
-        if not nonce_path.exists():
-            failures.append(f"CODEX_AUDIT.json: nonce file {nonce_path} missing (orchestrator did not seed challenge)")
-            return
-        expected_nonce = nonce_path.read_text().strip()
-        if not expected_nonce:
-            failures.append(f"CODEX_AUDIT.json: nonce file {nonce_path} is empty")
-            return
-        got_nonce = str(audit.get("nonce", "")).strip()
-        if got_nonce != expected_nonce:
+    # v0.3.1 (codex review P0-3): nonce + SHA256 cross-check is NOT optional. If
+    # --require-codex-audit was passed but no --audit-nonce-file, fall back to
+    # branch_dir/AUDIT_NONCE; if that also missing, FAIL. Skipping the cross-check
+    # was a trust kernel hole — an agent could pre-write CODEX_AUDIT.json and
+    # the orchestrator would accept it as proof of codex review without proof
+    # that codex actually saw the files.
+    if nonce_path is None:
+        fallback_nonce = branch_dir / "AUDIT_NONCE"
+        if fallback_nonce.exists():
+            nonce_path = fallback_nonce
+        else:
             failures.append(
-                f"CODEX_AUDIT.json: nonce mismatch (got {got_nonce!r}, expected {expected_nonce!r}). "
-                f"This suggests the file was pre-written before the orchestrator's codex call."
+                "CODEX_AUDIT.json: --require-codex-audit set but no nonce file "
+                "(neither --audit-nonce-file nor branch_dir/AUDIT_NONCE). "
+                "Refusing to accept self-reported codex verdict — see signiture 2 "
+                "(nonce + SHA256 cross-check) in design_principles.md."
             )
             return
 
-        # Files-read SHA256 cross-check
-        files_read = audit.get("files_read")
-        if not isinstance(files_read, dict) or not files_read:
-            failures.append(
-                "CODEX_AUDIT.json: 'files_read' must be a dict {relative_path: sha256} "
-                "with at least RESULT.md, metrics.json, data/test_split.json"
-            )
-            return
-        required_files = CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE.get(
-            task_type, CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE["training"]
+    if not nonce_path.exists():
+        failures.append(f"CODEX_AUDIT.json: nonce file {nonce_path} missing (orchestrator did not seed challenge)")
+        return
+    expected_nonce = nonce_path.read_text().strip()
+    if not expected_nonce:
+        failures.append(f"CODEX_AUDIT.json: nonce file {nonce_path} is empty")
+        return
+    got_nonce = str(audit.get("nonce", "")).strip()
+    if got_nonce != expected_nonce:
+        failures.append(
+            f"CODEX_AUDIT.json: nonce mismatch (got {got_nonce!r}, expected {expected_nonce!r}). "
+            f"This suggests the file was pre-written before the orchestrator's codex call."
         )
-        missing_required = required_files - set(files_read.keys())
-        if missing_required:
+        return
+
+    # Files-read SHA256 cross-check
+    files_read = audit.get("files_read")
+    if not isinstance(files_read, dict) or not files_read:
+        failures.append(
+            "CODEX_AUDIT.json: 'files_read' must be a dict {relative_path: sha256} "
+            "with at least RESULT.md, metrics.json, data/test_split.json"
+        )
+        return
+    required_files = CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE.get(
+        task_type, CODEX_AUDIT_REQUIRED_FILES_BY_TASK_TYPE["training"]
+    )
+    missing_required = required_files - set(files_read.keys())
+    if missing_required:
+        failures.append(
+            f"CODEX_AUDIT.json: 'files_read' missing required entries for "
+            f"task_type={task_type}: {sorted(missing_required)}"
+        )
+        return
+    for rel_path, claimed_sha in files_read.items():
+        actual_file = branch_dir / rel_path
+        if not actual_file.exists():
+            failures.append(f"CODEX_AUDIT.json: claims to have read {rel_path} but file does not exist")
+            continue
+        actual_sha = sha256_file(actual_file)
+        if actual_sha != str(claimed_sha).strip():
             failures.append(
-                f"CODEX_AUDIT.json: 'files_read' missing required entries for "
-                f"task_type={task_type}: {sorted(missing_required)}"
+                f"CODEX_AUDIT.json: SHA256 mismatch for {rel_path} — codex claims "
+                f"{claimed_sha}, actual {actual_sha}. File changed after audit, or audit fake?"
             )
-            return
-        for rel_path, claimed_sha in files_read.items():
-            actual_file = branch_dir / rel_path
-            if not actual_file.exists():
-                failures.append(f"CODEX_AUDIT.json: claims to have read {rel_path} but file does not exist")
-                continue
-            actual_sha = sha256_file(actual_file)
-            if actual_sha != str(claimed_sha).strip():
-                failures.append(
-                    f"CODEX_AUDIT.json: SHA256 mismatch for {rel_path} — codex claims "
-                    f"{claimed_sha}, actual {actual_sha}. File changed after audit, or audit fake?"
-                )
 
 
 def check_done_ready(
@@ -645,9 +683,11 @@ def check_data_acquisition_artifacts(branch_dir: Path, failures: list, evidence:
     # v0.1.9: accept both string (single file) and list-of-strings (multi-file pulls
     # like MSigDB Hallmark + Reactome). Earlier code crashed on list inputs.
     local_rel = m.get("local_path")
+    claimed_checksum = m.get("checksum")
     if local_rel is not None:
         local_paths_raw = local_rel if isinstance(local_rel, list) else [local_rel]
         total_bytes = 0
+        actual_shas: list[str] = []
         for lp in local_paths_raw:
             if not isinstance(lp, str):
                 failures.append(
@@ -661,8 +701,42 @@ def check_data_acquisition_artifacts(branch_dir: Path, failures: list, evidence:
                 )
             else:
                 total_bytes += local_path.stat().st_size
+                actual_shas.append(sha256_file(local_path))
         if total_bytes:
             evidence["local_file_bytes"] = total_bytes
+        # v0.3.1 (codex review P1-2): actually recompute SHA256 and compare,
+        # don't trust field existence. Single file: checksum == sha256(file).
+        # Multi-file: checksum is dict {filename: sha256} OR a list[sha256] in
+        # the same order as local_path.
+        evidence["computed_sha256"] = actual_shas
+        if isinstance(claimed_checksum, str) and len(actual_shas) == 1:
+            evidence["claimed_checksum"] = claimed_checksum
+            if claimed_checksum.lower() != actual_shas[0].lower():
+                failures.append(
+                    f"DATA_MANIFEST.json: checksum mismatch — claimed {claimed_checksum!r}, "
+                    f"sha256({local_paths_raw[0]})={actual_shas[0]!r}. Field-existence "
+                    f"check alone is not enough; sha256 must reproduce."
+                )
+        elif isinstance(claimed_checksum, dict) and len(actual_shas) > 0:
+            evidence["claimed_checksum"] = claimed_checksum
+            for lp, actual_sha in zip(local_paths_raw, actual_shas):
+                want = claimed_checksum.get(lp) or claimed_checksum.get(Path(lp).name)
+                if not want:
+                    failures.append(
+                        f"DATA_MANIFEST.json: checksum dict has no entry for {lp!r}"
+                    )
+                elif str(want).lower() != actual_sha.lower():
+                    failures.append(
+                        f"DATA_MANIFEST.json: checksum mismatch for {lp} — "
+                        f"claimed {want!r}, actual sha256={actual_sha!r}."
+                    )
+        elif isinstance(claimed_checksum, list) and len(claimed_checksum) == len(actual_shas):
+            for lp, want, actual_sha in zip(local_paths_raw, claimed_checksum, actual_shas):
+                if str(want).lower() != actual_sha.lower():
+                    failures.append(
+                        f"DATA_MANIFEST.json: checksum mismatch for {lp} — "
+                        f"claimed {want!r}, actual sha256={actual_sha!r}."
+                    )
 
 
 def check_framing_decision(branch_dir: Path, failures: list, evidence: dict) -> None:

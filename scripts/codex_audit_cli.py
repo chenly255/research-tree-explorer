@@ -17,6 +17,15 @@ nonce or the files until we open them in the prompt, and its response is
 cryptographically pinned to the file contents it inspects (we recompute and
 cross-check).
 
+v0.3.1 KNOWN LIMITATION (codex review P1-3): the SHA echo path proves the
+*prompt the orchestrator built* matches what the validator re-hashes from
+disk. It does NOT prove that GPT-5.5 actually read the inlined content —
+since the prompt itself contains the SHA, the model can echo without
+parsing the inlined bytes. A proper fix needs a challenge-fragment scheme
+(model must quote text at a random offset) or tool-call SHA computation;
+v0.3.1 mitigates by FAILing large files (> MAX_INLINE_BYTES) instead of
+truncating the middle, so the echo isn't trivially won on partial input.
+
 Usage (called by autopilot step 6c instead of mcp__codex__codex):
     python3 codex_audit_cli.py \\
         --branch-dir .research-tree/branches/1.1 \\
@@ -61,6 +70,11 @@ REQUIRED_FILES_BY_TASK_TYPE: dict[str, list[str]] = {
     "data-acquisition": ["RESULT.md", "DATA_MANIFEST.json"],
 }
 
+# v0.3.1 — refuse to silently truncate inlined files. If a required file
+# exceeds this, we fail loudly rather than continuing on a partial view that
+# the model can SHA-echo without seeing the missing middle.
+MAX_INLINE_BYTES = 12000
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -99,12 +113,10 @@ def build_prompt(
 ) -> str:
     file_block = []
     for rel, content in files_with_content.items():
-        truncated = content
-        if len(content) > 12000:
-            truncated = content[:6000] + "\n…[truncated middle]…\n" + content[-6000:]
+        # v0.3.1: never truncate. caller already filtered oversize files.
         file_block.append(
             f"---FILE START: {rel} (sha256={files_with_sha[rel]})---\n"
-            f"{truncated}\n"
+            f"{content}\n"
             f"---FILE END: {rel}---"
         )
     files_section = "\n\n".join(file_block)
@@ -221,6 +233,20 @@ def main() -> int:
         if not p.exists():
             print(f"ERROR: required file missing for task_type={args.task_type}: {rel}",
                   file=sys.stderr)
+            return 1
+        size = p.stat().st_size
+        if size > MAX_INLINE_BYTES:
+            # v0.3.1 (codex review P1-3): refuse oversized inline rather than
+            # silently truncate. With truncation the model could SHA-echo a
+            # complete file it only half-saw. Caller must split the audit or
+            # supply a smaller artifact summary.
+            print(
+                f"ERROR: {rel} is {size} bytes > MAX_INLINE_BYTES={MAX_INLINE_BYTES}. "
+                f"Refusing to truncate-and-audit (would invalidate SHA-echo proof). "
+                f"Either summarize the file in a smaller artifact, or implement "
+                f"chunked audit (not yet supported in v0.3.1).",
+                file=sys.stderr,
+            )
             return 1
         try:
             files_with_content[rel] = p.read_text(errors="replace")

@@ -3,6 +3,33 @@
 > 每个版本为什么这么做. 怀疑某个 patch 该不该撤回时, 来这里查原委。
 > 新决策按倒序追加 (最新在顶部)。
 
+## 2026-05-25 — v0.3.1: Linus + codex 双盲审吸收 + trust kernel 加固
+
+**决策**: Linus 风格 review 找 10+ 问题, codex 独立盲审又找 4 个 Claude 漏看的 (含 2 个 trust kernel 绕过), 全部修。新增"Claude 写 + Claude 自审" 必须配 codex 二审的实践规则。
+
+**触发**: Lily "用 linus 扫一下我们的 research-tree 这个项目". Claude 自己审找了 race condition + counter 不一致 + YAGNI 一堆中等问题。Lily 接着说"那你自己调用 codex 再审一遍 然后自己改了呗" — 后续 codex 二审找出 Claude 完全漏看的 2 个 P0 trust kernel 洞:
+- cmd_complete 接受任意路径的 `{"verdict":"PASS"}` json
+- charter_validator --require-codex-audit 不传 nonce-file 时整段 SHA cross-check 被跳过
+
+**为什么这两个 Claude 自己审会漏**: 因为信条 1/2 (物理验证 + nonce+SHA) 是 Claude 觉得"自己写的最得意的层", 对这层的怀疑性最低。AI 写代码 + AI 自审, 同一个 AI 的盲点会保留。**codex 二审就是为了破这个盲点**。
+
+**修了什么**:
+- P0 trust kernel: cmd_complete 自己 fork validator (subprocess), 不接受 user JSON; nonce 检查变 mandatory; test_split.json + DATA_MANIFEST.json 真重算 sha256
+- P0 race + counter: 3 个 mutate cmd 补 state_lock; 4 个 status 路径走 _apply_status_transition
+- P1 fork 预算: apply_subtree_fork 加 max_depth / max_branches / max_total_nodes
+- P1 stale_running: 加 pid_starttime cross-check 防 PID 复用
+- P2 state_lock: 用 O_NOFOLLOW 防 symlink 截断
+- P2 cleanup: 删 agent_capable / max_repair_attempts 节点字段 / subtree_origin, 抽 _build_new_node
+
+**留 v0.3.2 的**:
+- codex_audit_cli SHA-echo 根本设计缺陷 (challenge-fragment 重设计)
+- forked/abandoned 状态合并
+- PID 链 → $RESEARCH_TREE_SESSION_ID
+
+**未来回头看**: 这次的"Linus + codex 双审" pattern 应该成为 tool 改动的标准实践 — Claude 自己审完一定要 codex 二审, 不然 trust kernel 这种 Claude "自我感觉良好"的层会留洞。memory/competitor_analysis.md 应该补一条 "AI 自审有系统性盲点"。
+
+---
+
 ## 2026-05-25 — v0.3.0: 闭 LangGraph + fractal agent 两个 gap
 
 **决策**: 加 `phase_checkpoint.py` (LangGraph 风格 sub-step checkpoint) + 在 SKILL.md 文档化 fractal agent (subagent 也能用 Agent 工具)。

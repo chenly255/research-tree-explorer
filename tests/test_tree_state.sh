@@ -38,16 +38,37 @@ if python3 "$TS" set "$ID1" status=dead 2>/dev/null; then
 fi
 echo "  set lockdown works"
 
-echo "=== test: complete requires PASSING validator report ==="
-# Create a FAIL validator report — complete should refuse
-echo '{"verdict": "FAIL", "failures": ["fake"]}' > "$TMP/bad_report.json"
-if python3 "$TS" complete "$ID1" --validator-report "$TMP/bad_report.json" --score 0.9 2>/dev/null; then
-    echo "FAIL: complete should refuse FAIL validator report"
+echo "=== test: complete v0.3.1 — runs validator from disk, rejects empty branch ==="
+# v0.3.1 (codex review P0-1): cmd_complete no longer accepts user-supplied
+# arbitrary JSON. It runs charter_validator on branch_dir directly. An empty
+# branch_dir must FAIL the validator and complete must refuse.
+if python3 "$TS" complete "$ID1" --score 0.9 2>/dev/null; then
+    echo "FAIL: complete should refuse empty branch_dir (no RESULT.md / metrics.json / etc)"
     exit 1
 fi
-# Create a PASS report — should accept
-echo '{"verdict": "PASS", "failures": [], "warnings": []}' > "$TMP/good_report.json"
-python3 "$TS" complete "$ID1" --validator-report "$TMP/good_report.json" --score 0.8 > /dev/null
+# To complete a node, the branch_dir must really pass the validator. Mock an
+# `analysis` task_type since it has the fewest physical requirements.
+python3 "$TS" set "$ID1" task_type=analysis > /dev/null
+BR="$TMP/.research-tree/branches/$ID1"
+mkdir -p "$BR"
+cat > "$BR/RESULT.md" <<'EOF'
+# branch A result
+
+METRIC: 0.42
+
+## Charter compliance
+
+| Rule | Verdict |
+|---|---|
+| 0. Anti-laziness preamble | PASS |
+| 4. Evaluation rules | PASS |
+| 6. Novelty rules | PASS |
+| 7. Reproducibility rules | PASS |
+| 8. Compute honesty | PASS |
+EOF
+echo '{"summary": "analysis ok"}' > "$BR/analysis_output.json"
+echo 'numpy==1.26.0' > "$BR/requirements.txt"
+python3 "$TS" complete "$ID1" --score 0.8 > /dev/null
 
 echo "=== test: die marks dead with reason ==="
 python3 "$TS" die "$ID2" --reason "bad approach" > /dev/null
@@ -193,8 +214,27 @@ TMP5=$(mktemp -d)
 cd "$TMP5"
 python3 "$TS" init "reopen-test" > /dev/null
 NID=$(python3 "$TS" add root approach "x")
-echo '{"verdict": "PASS"}' > /tmp/rte_pass.json
-python3 "$TS" complete "$NID" --validator-report /tmp/rte_pass.json --score 0.7 > /dev/null
+# v0.3.1 — need real branch_dir artifacts to complete (no user-supplied PASS json)
+python3 "$TS" set "$NID" task_type=analysis > /dev/null
+BR5="$TMP5/.research-tree/branches/$NID"
+mkdir -p "$BR5"
+cat > "$BR5/RESULT.md" <<'EOF'
+# x result
+
+METRIC: 0.7
+
+## Charter compliance
+
+| Rule | Verdict |
+|---|---|
+| 0. Anti-laziness preamble | PASS |
+| 4. Evaluation rules | PASS |
+| 7. Reproducibility rules | PASS |
+| 8. Compute honesty | PASS |
+EOF
+echo '{"summary": "ok"}' > "$BR5/analysis_output.json"
+echo 'numpy==1.26.0' > "$BR5/requirements.txt"
+python3 "$TS" complete "$NID" --score 0.7 > /dev/null
 python3 "$TS" reopen "$NID" > /dev/null
 NODE=$(python3 "$TS" get "$NID")
 echo "$NODE" | python3 -c "

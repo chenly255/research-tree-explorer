@@ -50,24 +50,56 @@ STATE_DIR_NAME = ".research-tree"
 STATE_FILE_NAME = "tree.json"
 
 
-def pid_alive(pid: int) -> bool:
-    """Return True if a process with this pid is still running.
+def read_pid_starttime(pid: int) -> int | None:
+    """Read /proc/<pid>/stat field 22 (starttime in clock ticks since boot).
 
-    Uses kill(pid, 0) which sends no signal but errors if the process is gone
-    or if we don't have permission. Permission errors are treated as alive
-    (we'd rather false-positive 'alive' than false-positive 'dead' and lose
-    a running training job to a premature death-marking).
+    Returns None if /proc unavailable or pid gone. Used to disambiguate PID
+    reuse — when a long-running training process dies and the OS rolls the
+    PID counter, a totally unrelated process can land on the same PID number.
+    Comparing starttime catches that.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+        # field 1 = pid, field 2 = (comm) in parens (may contain spaces),
+        # field 3+ space-separated. starttime is field 22 (1-indexed).
+        rparen = data.rfind(b")")
+        if rparen < 0:
+            return None
+        tail = data[rparen + 1:].split()
+        # field 3 is tail[0], so field 22 is tail[19]
+        if len(tail) < 20:
+            return None
+        return int(tail[19])
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid: int, expected_starttime: int | None = None) -> bool:
+    """Return True if a process with this pid is still running, AND if
+    expected_starttime is given, the process's start time still matches.
+
+    v0.3.1 (codex review P1-4): bare kill(pid, 0) treats zombies as alive and
+    cannot distinguish PID reuse. When EXECUTOR.json was written we now record
+    /proc/<pid>/stat field 22 (starttime); on every check we re-read and
+    compare. Mismatch = PID was reused, the original process is gone.
     """
     if pid <= 0:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         # Process exists but is owned by another user; conservatively assume alive
         return True
+    if expected_starttime is None:
+        return True
+    actual_starttime = read_pid_starttime(pid)
+    if actual_starttime is None:
+        # /proc unreadable — fall back to "alive" rather than killing a real process
+        return True
+    return actual_starttime == expected_starttime
 
 
 def first_line(path: Path) -> str:
@@ -113,9 +145,15 @@ def classify_node(node: dict, root: Path) -> tuple[str, dict]:
     detail["pid"] = pid
     detail["started_at"] = executor.get("started_at")
     detail["log_file"] = executor.get("log_file")
+    expected_starttime = executor.get("pid_starttime")  # v0.3.1 — Linux clock ticks
+    if isinstance(expected_starttime, int):
+        detail["pid_starttime_expected"] = expected_starttime
 
-    if pid_alive(pid):
+    if pid_alive(pid, expected_starttime=expected_starttime if isinstance(expected_starttime, int) else None):
         return "alive", detail
+    if isinstance(expected_starttime, int) and read_pid_starttime(pid) is not None:
+        # PID exists but starttime differs — definitely PID reuse, not our process
+        detail["pid_reuse_detected"] = True
 
     # Process is dead — what evidence did it leave?
     if dead_path.exists():

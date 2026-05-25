@@ -130,9 +130,9 @@ done
 cat > proj/.research-tree/tree.json <<'JSON'
 {"nodes": {
   "r":  {"id":"r",  "parent_id": null, "title": "root junction", "status": "completed", "depth": 0},
-  "c1": {"id":"c1", "parent_id": "r",  "title": "atlas A",       "status": "completed", "depth": 1},
-  "c2": {"id":"c2", "parent_id": "r",  "title": "atlas B",       "status": "completed", "depth": 1},
-  "c3": {"id":"c3", "parent_id": "r",  "title": "atlas C",       "status": "completed", "depth": 1}
+  "c1": {"id":"c1", "parent": "r",  "title": "atlas A",       "status": "completed", "depth": 1},
+  "c2": {"id":"c2", "parent": "r",  "title": "atlas B",       "status": "completed", "depth": 1},
+  "c3": {"id":"c3", "parent": "r",  "title": "atlas C",       "status": "completed", "depth": 1}
 }}
 JSON
 AGG=$(python3 "$SD" aggregate r --project-root proj)
@@ -178,8 +178,8 @@ EOF
 cat > proj2/.research-tree/tree.json <<'JSON'
 {"nodes": {
   "r": {"id":"r", "parent_id": null, "title": "root", "status": "completed", "depth": 0},
-  "s": {"id":"s", "parent_id": "r",  "title": "strong", "status": "completed", "depth": 1},
-  "n": {"id":"n", "parent_id": "r",  "title": "null",   "status": "completed", "depth": 1}
+  "s": {"id":"s", "parent": "r",  "title": "strong", "status": "completed", "depth": 1},
+  "n": {"id":"n", "parent": "r",  "title": "null",   "status": "completed", "depth": 1}
 }}
 JSON
 AGG=$(python3 "$SD" aggregate r --project-root proj2)
