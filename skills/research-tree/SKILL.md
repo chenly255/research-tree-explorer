@@ -347,6 +347,33 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
 
    - **v0.2.0 — retry context**. If this node's `last_failure_context` field is non-null, paste it at the top of the agent prompt verbatim under header "PREVIOUS ATTEMPT FAILED — avoid repeating these specific mistakes:". Get the field by running `python3 "$TREE_STATE" get <node_id> | python3 -c "import json,sys; print(json.load(sys.stdin).get('last_failure_context') or '')"`. The agent knows what NOT to do.
 
+   - **v0.3.0 — sub-step checkpointing (long-running branches only)**. For branches that take > 30 minutes (any training, multi-step audit, multi-file download), the agent SHOULD use phase_log.jsonl checkpointing so a crash mid-execution is resumable not catastrophic. Tell the agent verbatim:
+
+     "If your work is long enough to potentially crash mid-flight (training, multi-file download, multi-seed sweep), break it into named phases. At the start of each phase, mark it:
+       ```bash
+       python3 $RTE_REPO/scripts/phase_checkpoint.py mark .research-tree/branches/<node_id> --phase setup --action start
+       # ... do setup work ...
+       python3 $RTE_REPO/scripts/phase_checkpoint.py mark .research-tree/branches/<node_id> --phase setup --action complete --checkpoint-file data/test_split.json
+       ```
+     At the **start of each phase**, ALSO check if it's already complete (idempotent resume):
+       ```bash
+       if python3 $RTE_REPO/scripts/phase_checkpoint.py is-complete .research-tree/branches/<node_id> --phase setup; then
+         echo \"phase setup already done in prior attempt, skipping\"
+       else
+         # do the actual setup work, then mark complete
+       fi
+       ```
+     Suggested phase names (use these unless you have reason to change): `setup` (load data, build model), `train_seed_0` / `train_seed_1` / `train_seed_2`, `eval`, `ablations`, `finalize` (write RESULT.md / metrics.json). The orchestrator's stale-running detector will, on crash, automatically re-spawn you with last_failure_context set to which phases were done and which to resume from. **You do NOT need to manually persist intermediate state — the phase log is the resume contract**. Just be honest about phase boundaries (don't mark 'complete' if it wasn't)."
+
+   - **v0.3.0 — recursive sub-decisions (fractal agent)**. The subagent has access to the `Agent` tool (its tools include `Agent` because subagent_type=general-purpose is "Tools: *"). Tell it:
+
+     "For sub-decisions YOU need to own internally (not tree-level forks — those go via SUBTREE_FORK.md), you can spawn your own sub-subagent via the Agent tool. Use this when a single research step has an internal exploration that doesn't deserve to be a permanent tree node, but is too complex to think through in your own context. Example: 'before I commit to GSVA, let me spawn a quick sub-agent to test all three (GSVA / AUCell / ssGSEA) on a 1000-cell pilot and report Spearman correlations'. The sub-subagent returns a result; you absorb it and continue your branch's main work.
+
+     Two paths to fork the tree are distinct:
+       - **In-context sub-agent via Agent tool**: ephemeral, for sub-decisions you own. Result is a return value you read. Does NOT create a tree node. Use when you're CURRENTLY working and just need a quick parallel exploration.
+       - **SUBTREE_FORK.md**: persistent, becomes new tree nodes. Use when the sub-decisions deserve full validation / codex audit / their own RESULT.md each.
+     The distinction is: 'do I need a quick assist, or is this really 3 competing experiments?' If 3 competing experiments → SUBTREE_FORK. If 'just help me decide on one thing' → in-context sub-agent."
+
    - **v0.1.6 — task_type-aware artifact requirements**. Read the node's `task_type` field (from `python3 "$TREE_STATE" get <node_id>` → `.task_type`) and tell the subagent the artifact set that matches its task_type. The orchestrator MUST select ONE of the following blocks based on the node's `task_type`:
 
      **For `task_type=training` (default, v0.1.5 behavior)**:
@@ -700,6 +727,15 @@ A single autopilot step does this:
          # is done — finishing in-flight work is higher priority than
          # starting new work.
          dispatch validation chain for <node_id>; STOP this autopilot step here.
+     for each node in `ready_for_resume`:
+         # v0.3.0 — phase_log.jsonl shows partial progress; the crash is
+         # resumable not abandoned. Use repair-retry with the phase context
+         # so the new agent reads phase_log.jsonl and skips completed phases.
+         python3 "$TREE_STATE" --project-root "$(pwd)" repair-retry <node_id> \
+             --failure-context "executor crashed mid-execution at phase=<resumable_from_phase>; phase_log.jsonl shows <completed_phases> already done — skip those, resume from <resumable_from_phase>. If retry budget allows, the new agent will continue from the partial state."
+         # If repair-retry returns exit 2 (budget exhausted), die the node:
+         python3 "$TREE_STATE" die <node_id> --reason "executor crash with phase_log partial, repair budget exhausted"
+         # STOP this autopilot step; next tick picks up the now-pending node.
      for each node in `alive`:
          # process still running, leave alone; pick-next won't pick it.
          log "node <id> still running pid=<pid> since <started_at>"

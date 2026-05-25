@@ -123,6 +123,33 @@ def classify_node(node: dict, root: Path) -> tuple[str, dict]:
         return "ready_for_death_from_file", detail
     if result_path.exists():
         return "ready_for_validation", detail
+
+    # v0.3.0 — before declaring abandoned, check phase_log.jsonl. If the branch
+    # was using sub-step checkpointing AND at least one phase completed, the
+    # crash is RESUMABLE not abandoned. Orchestrator can repair-retry the
+    # branch and the new agent reads phase_log.jsonl to skip done phases.
+    phase_log = branch_dir / "phase_log.jsonl"
+    if phase_log.exists():
+        try:
+            lines = [
+                json.loads(line) for line in phase_log.read_text().splitlines()
+                if line.strip()
+            ]
+            completed_phases = [e["phase"] for e in lines if e.get("completed_at")]
+            incomplete_phases = [e["phase"] for e in lines if not e.get("completed_at")]
+            if completed_phases:
+                detail["reason"] = (
+                    f"executor pid {pid} crashed mid-execution; phase_log shows "
+                    f"{len(completed_phases)} phase(s) complete: {completed_phases}, "
+                    f"crashed during {incomplete_phases[:1]}. Resumable via phase_checkpoint."
+                )
+                detail["resumable_from_phase"] = incomplete_phases[0] if incomplete_phases else None
+                detail["completed_phases"] = completed_phases
+                return "ready_for_resume", detail
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            # malformed phase log — fall through to abandoned
+            detail["phase_log_parse_error"] = str(e)
+
     detail["reason"] = (
         f"executor pid {pid} exited without writing RESULT.md or DEAD.md "
         f"(check {detail.get('log_file', branch_dir / 'executor.log')} for trace)"
@@ -145,6 +172,7 @@ def main() -> int:
         "alive": [],
         "ready_for_validation": [],
         "ready_for_death_from_file": [],
+        "ready_for_resume": [],  # v0.3.0 — phase_log shows partial progress, can resume
         "abandoned": [],
         "legacy_orphan": [],
     }
