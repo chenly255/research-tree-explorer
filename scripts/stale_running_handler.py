@@ -205,6 +205,17 @@ def main() -> int:
     if not state_path.exists():
         sys.exit(f"ERROR: no tree.json at {state_path}")
     state = json.loads(state_path.read_text())
+    # v0.4.0 codex-final P1-3: apply migration so forked → expanded etc. are
+    # reflected in the read path (synthesize-style readers don't go through
+    # tree_state.load_state).
+    _script_dir = Path(__file__).resolve().parent
+    if str(_script_dir) not in sys.path:
+        sys.path.insert(0, str(_script_dir))
+    try:
+        from tree_state import _migrate_state  # type: ignore
+        _migrate_state(state)
+    except ImportError:
+        pass
 
     buckets: dict[str, list] = {
         "alive": [],

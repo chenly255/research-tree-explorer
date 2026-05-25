@@ -3,6 +3,74 @@
 > 每个版本为什么这么做. 怀疑某个 patch 该不该撤回时, 来这里查原委。
 > 新决策按倒序追加 (最新在顶部)。
 
+## 2026-05-25 — v0.4.0: 质量第一模式 — 三轮 codex audit, 不留尾巴
+
+**决策**: Lily 触发 "质量第一" 模式 ("不要留尾巴 一起完善好"). v0.3.1 留下的 3 个
+"deferred to v0.3.2" 全做完, 但 quality-first 不只是做 deferreds — 还要顶住
+**三轮 codex audit** 让真的没漏洞。三轮发现的所有 P0/P1/P2 都修了, 没有任何
+"deferred to v0.4.1"。linus-review skill 同步加 "质量第一" 覆盖模式。
+
+**关键教训 (写进 lessons learned)**:
+
+1. **AI 修代码会引入新漏洞**: Round 2 之后 Claude 修了 7 个 P1, Round 3 又找
+   到 2 个 NEW P1 ("Claude 修复时引入的"). 例: 修 challenge-fragment 时 Claude
+   把 expected_text 预写到 agent 可读的 branch_dir, 彻底击穿了新加的 anti-
+   fabrication 防御. 修 cmd_complete trust kernel 时让 codex audit 变可选, 
+   绕过了整个外部审计层。**结论: 每个修复 round 都要 codex re-audit, 不能
+   "改完就 OK"**.
+
+2. **trust-kernel 是 Claude 盲点**: 三轮所有的 P0 trust kernel 绕过都是 Claude
+   自己审漏的, 都是 codex 找出来的. Claude 对自己写的 "trust kernel" 层有
+   过度自信。
+
+3. **N=3 rounds 才够**: Round 2 找了 4 个 Claude 漏的, Round 3 找了 6 个 Claude
+   修出来的, Round 4 (本轮即将完成) verify. **任何 trust-kernel 类改动至少 3 轮
+   codex audit**.
+
+**触发**: Lily 看完 v0.3.1 commit 后说 "为什么还要留下一些东西啊 不能一起做完吗
+你帮我全都优化好 不要在乎工作量和时间 我们以质量为第一目标". 这是显式覆盖 KISS/
+YAGNI 的指令, 必须按"做到完整"做。
+
+**做了什么**:
+
+1. **challenge-fragment 替代 SHA-echo** (codex round 2 P1-3 的根本修)
+   - 旧设计 (v0.3.1): orchestrator 把每文件 SHA 写进 prompt 给模型 echo. 模型不读
+     文件也能 echo, SHA cross-check 通过. 是 illusion of security.
+   - 新设计 (v0.4.0): orchestrator 在调模型前选 N 个 (file, random_byte_offset,
+     length=64) 窗口, 写 AUDIT_CHALLENGES.json. prompt 要求模型 verbatim quote
+     each window. validator 重读 disk + byte-for-byte cross-check. 模型不读
+     文件无法构造 64-byte verbatim fragment.
+   - 真 anti-fabrication, 不是工程便利。
+
+2. **forked → expanded 合并** (Linus #5 + codex P2-2)
+   - 删 forked 状态 (7→6); 状态合并消掉 7 处分支判断。
+   - load_state migration: 老 tree 的 forked → expanded, 同时清掉 3 个 dead 字段
+     (agent_capable / subtree_origin / max_repair_attempts).
+   - synthesize_report 加入 abandoned 到 alive bucket (修漏算).
+
+3. **PID 链 → $RESEARCH_TREE_SESSION_ID** (Linus #6 + codex P2-1)
+   - 删 30 行 /proc 解析, 改 env var 1 行查询.
+   - 跨平台 + Claude Code restart 不误判 + autopilot 入口 export uuidgen.
+
+4. **SKILL.md 接口对齐** — cmd_complete 改新签名, EXECUTOR.json 加 pid_starttime
+   字段, autopilot 入口 export RESEARCH_TREE_SESSION_ID, forked → expanded 文档化。
+
+5. **测试**: 加 6 个 v0.4 specific tests, 6/6 套件全绿.
+
+6. **linus-review skill 加质量第一模式** — 触发词 "质量第一 / 不留尾 / 不要在乎工作
+   量" 立即切换 skill 行为: 不允许 deferred, 必须做完整修 (e.g. 不能写"留 v0.4.1
+   再做"), 必须 codex final 二审. 见 `~/.claude/skills/linus-review/SKILL.md`.
+
+**为什么这次彻底**: v0.3.1 心态是"P0/P1 修了 P2 留下", 是 "默认务实" 心态。但当用户
+明确说 "质量第一" 时, P2 也是必须修, 不然 "known limitation" 留着就是潜在用户痛点。
+这次的教训写进 linus-review skill 让以后 skill 自己懂得切换。
+
+**未来回头看**: 第三方使用者用 research-tree-explorer 时, 应该看 design_principles.md
+里"质量第一覆盖原则" — 工具默认 KISS, 但项目级 ROI 要求 (顶刊审稿人 / production) 触
+发时, 必须能切换到 "全做完" 模式。
+
+---
+
 ## 2026-05-25 — v0.3.1: Linus + codex 双盲审吸收 + trust kernel 加固
 
 **决策**: Linus 风格 review 找 10+ 问题, codex 独立盲审又找 4 个 Claude 漏看的 (含 2 个 trust kernel 绕过), 全部修。新增"Claude 写 + Claude 自审" 必须配 codex 二审的实践规则。

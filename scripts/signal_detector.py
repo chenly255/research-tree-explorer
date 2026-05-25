@@ -58,6 +58,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# v0.4.0 codex-final P1-3 — share migration helper with tree_state so direct
+# readers see the same migrated schema (forked → expanded, dropped fields).
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+try:
+    from tree_state import _migrate_state as _migrate  # type: ignore
+except ImportError:
+    def _migrate(state: dict) -> bool:  # type: ignore
+        return False
+
+
+def _read_state_migrated(tree_path: Path) -> dict:
+    state = json.loads(tree_path.read_text())
+    _migrate(state)
+    return state
+
 # Default thresholds. A project can override via charter.signal_thresholds
 # in tree.json's root metadata (future extension; falling back to defaults).
 DEFAULTS = {
@@ -285,7 +302,7 @@ def aggregate(parent_id: str, project_root: Path, cfg: dict | None = None) -> di
     tree_path = project_root / ".research-tree" / "tree.json"
     if not tree_path.exists():
         return {"error": f"tree.json not found at {tree_path}"}
-    state = json.loads(tree_path.read_text())
+    state = _read_state_migrated(tree_path)
     nodes = state.get("nodes", {})
     parent = nodes.get(parent_id)
     if parent is None:
@@ -357,7 +374,7 @@ def check_pivot(project_root: Path, cfg: dict | None = None) -> dict[str, Any]:
     tree_path = project_root / ".research-tree" / "tree.json"
     if not tree_path.exists():
         return {"error": f"tree.json not found at {tree_path}"}
-    state = json.loads(tree_path.read_text())
+    state = _read_state_migrated(tree_path)
     nodes = state.get("nodes", {})
 
     junctions: list[str] = []

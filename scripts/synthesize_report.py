@@ -18,13 +18,27 @@ STATE_DIR_NAME = ".research-tree"
 STATE_FILE_NAME = "tree.json"
 REPORT_FILE_NAME = "FINAL_REPORT.md"
 
+# v0.4.0 codex-final P1-3: use the canonical migration helper from tree_state
+# so direct readers see the same schema (forked → expanded, dead fields
+# dropped) as mutate paths.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+try:
+    from tree_state import _migrate_state  # type: ignore
+except ImportError:
+    _migrate_state = None  # graceful degradation; readers see un-migrated state
+
 
 def load_state(root: Path) -> dict:
     p = root / STATE_DIR_NAME / STATE_FILE_NAME
     if not p.exists():
         sys.exit(f"ERROR: no tree found at {p}")
     with p.open() as f:
-        return json.load(f)
+        state = json.load(f)
+    if _migrate_state is not None:
+        _migrate_state(state)
+    return state
 
 
 def render_tree(state: dict) -> list[str]:
@@ -32,9 +46,10 @@ def render_tree(state: dict) -> list[str]:
 
     def walk(node_id: str, prefix: str, is_last: bool) -> None:
         n = state["nodes"][node_id]
-        marker = {"completed": "✓", "dead": "✗", "running": "►", "expanded": "▸", "pending": "·"}.get(
-            n["status"], "?"
-        )
+        marker = {
+            "completed": "✓", "dead": "✗", "running": "►",
+            "expanded": "▸", "pending": "·", "abandoned": "⏸",
+        }.get(n["status"], "?")
         score = f" [{n['score']:.2f}]" if n["score"] is not None else ""
         connector = "└── " if is_last else "├── "
         if node_id == "root":
@@ -67,9 +82,14 @@ def main() -> None:
         reverse=True,
     )
     dead = [n for n in nodes.values() if n["status"] == "dead"]
+    # v0.4.0 (codex review P2-2): include `abandoned` in the "still alive"
+    # bucket — branches set aside by the human are not deliverables and the
+    # report needs to list them so reviewers know what's parked. Before this
+    # fix, abandoned nodes vanished from FINAL_REPORT.md entirely.
     alive = [
         n for n in nodes.values()
-        if n["status"] in ("pending", "expanded", "running") and n["id"] != "root"
+        if n["status"] in ("pending", "expanded", "running", "abandoned")
+        and n["id"] != "root"
     ]
 
     lines: list[str] = []
@@ -159,12 +179,20 @@ def main() -> None:
 
     # DONE detection: requires (a) status=completed, (b) done_ready=true,
     # (c) completion_proof recorded (proves status was set via the validator
-    # chain, not a raw `set status=completed` bypass).
-    done_winner = next(
-        (n for n in completed
-         if n.get("done_ready") is True and n.get("completion_proof") is not None),
-        None,
-    )
+    # chain, not a raw `set status=completed` bypass), AND (d) the completion
+    # proof attests codex_audit_attested=True (v0.4.0 codex-final P1-新1 —
+    # unaudited completions exist for admin/fixture workflows but must never
+    # be promoted to DONE.md, which is the signal "ready for Lily to write
+    # the paper from").
+    def _done_eligible(n: dict) -> bool:
+        if not n.get("done_ready"):
+            return False
+        proof = n.get("completion_proof") or {}
+        if not proof:
+            return False
+        return bool(proof.get("codex_audit_attested"))
+
+    done_winner = next((n for n in completed if _done_eligible(n)), None)
     if done_winner is not None:
         done_path = root / STATE_DIR_NAME / "DONE.md"
         done_lines = [

@@ -58,19 +58,17 @@ HUMAN_GATE_FILE_NAME = "AWAITING_HUMAN.md"
 
 VALID_STATUSES = {
     "pending",     # not yet picked
-    "expanded",    # orchestrator has called expand and created children
+    "expanded",    # has children (regardless of who created them — orchestrator
+                   # expand or agent SUBTREE_FORK). v0.4.0 unified `forked` into
+                   # this; the "who created me" info lives on each child's
+                   # spawned_by_agent field instead.
     "running",     # subagent currently working (foreground or background)
     "completed",   # validated + (optionally) codex-audited PASS
     "dead",        # validator FAIL, DEAD.md, or final failure
-    # v0.2.0 — new status for agent-driven sub-forks. A `forked` node has
-    # children that an agent decided to create mid-execution (SUBTREE_FORK.md
-    # path), not orchestrator-driven expand. `forked` behaves like `expanded`
-    # for pick-next (skip parent, pick child), but synthesize_report counts
-    # it separately so the final report can show the agent's autonomy.
-    "forked",
     # v0.2.0 — agent-driven retreat. NOT a death. The branch wasn't completed
     # but it's set aside; Lily can `resume-branch` later. Used by /research-tree
-    # backtrack (interactive co-pilot mode).
+    # backtrack (interactive co-pilot mode). Distinct from `pending` because
+    # autopilot pick-next must skip it; reviving requires explicit resume-branch.
     "abandoned",
 }
 
@@ -92,12 +90,30 @@ VALID_KINDS = {"root", "approach", "architecture", "experiment", "ablation", "na
 # status transitions go through dedicated commands (complete, die) that require
 # proof / reason. This prevents a lazy subagent from doing `set <id> status=completed`
 # without going through the validator chain.
+# v0.4.0 codex-final P1-5: SET_ALLOWED_KEYS is now the bare-minimum surface.
+# Every field that influences trust kernel decisions (validation schema, branch
+# location, completion proof, done-ready), pick-next ordering (score), audit
+# linkage (junction_audit_id), or sibling DoS (depends_on / human_only) is
+# write-once-at-add or write-only-via-dedicated-command, never freeform-`set`.
+#
+# Why depends_on / human_only ARE trust-relevant (initial v0.4.0 left them in):
+#  - An agent can `set sibling depends_on=missing` to permanently block that
+#    sibling from `pick-next`, removing competition for compute.
+#  - An agent can `set sibling human_only=true` to make autopilot skip it.
+#  Both are sabotage paths, even if self-inflicted DoS too. Removed.
+#
+# `score` removed because changing a node's score reorders `pick-next` (higher
+# parent score wins) — an agent can game the priority queue post-hoc.
+# `junction_audit_id` removed because pointing at a different audit trace
+# rewrites history. The dedicated `audit-add` command is the only writer.
 SET_ALLOWED_KEYS = {
-    "description", "score", "death_reason", "death_evidence",
-    "done_ready", "completion_proof", "junction_audit_id", "branch_dir",
-    "direct_executable",
-    # v0.1.6 — task-type-aware nodes
-    "task_type", "depends_on", "human_only",
+    # v0.4.0 codex-final P2-新2: only fields that have no audit / trust
+    # consequence. death_reason and death_evidence are SET-ONCE at die time,
+    # not editable thereafter — letting an agent rewrite the death reason of
+    # a node it killed is audit history tampering. Use `annotate-death`
+    # for append-only post-mortem notes.
+    "description",
+    "direct_executable",  # set by expand-flow when proposer skipped
 }
 
 # Session step counter — autopilot reports `should_pause: true` when this many
@@ -175,19 +191,95 @@ def state_lock(root: Path) -> Iterator[None]:
             os.close(fd)
 
 
+def _migrate_state(state: dict[str, Any]) -> bool:
+    """v0.4.0 — schema migration helper. Returns True if anything changed
+    (caller persists). Centralizes all migration logic so direct JSON readers
+    (synthesize_report.py, signal_detector.py, stale_running_handler.py) can
+    call this too if they ever stop going through load_state.
+
+    Migrations applied:
+    - v0.1.6: backfill task_type / depends_on / human_only on pre-v0.1.6 nodes
+    - v0.4.0: collapse `forked` status (v0.2.0) into `expanded` — the behavioral
+      distinction was illusory; pick-next and synthesize_report both treated
+      them identically. Lineage info lives on `spawned_by_agent` field.
+    - v0.4.0: drop dead v0.2.0 node fields (agent_capable, subtree_origin,
+      max_repair_attempts) that v0.3.1 removed from new nodes but in-flight
+      trees still carry.
+    - v0.4.0 codex-final P1-7: recompute stats counters from actual node
+      statuses on every load so historical drift from non-atomic transitions
+      heals automatically.
+    """
+    dirty = False
+    nodes = state.get("nodes", {}).values()
+    for n in nodes:
+        if "task_type" not in n:
+            n["task_type"] = "mixed" if n.get("kind") == "root" else "training"
+            dirty = True
+        if "depends_on" not in n:
+            n["depends_on"] = []
+            dirty = True
+        if "human_only" not in n:
+            n["human_only"] = False
+            dirty = True
+        if n.get("status") == "forked":
+            n["status"] = "expanded"
+            dirty = True
+        for dead_field in ("agent_capable", "subtree_origin", "max_repair_attempts"):
+            if dead_field in n:
+                n.pop(dead_field, None)
+                dirty = True
+
+    # P1-7 — recompute stats on every load. If the in-memory state already
+    # matches, no dirty flag. If history drifted (counter bugs from older
+    # versions, race conditions), heal silently.
+    nodes_list = list(state.get("nodes", {}).values())
+    fresh_alive = sum(1 for n in nodes_list if n["status"] in ("pending", "expanded", "running"))
+    fresh_dead = sum(1 for n in nodes_list if n["status"] == "dead")
+    fresh_completed = sum(1 for n in nodes_list if n["status"] == "completed")
+    stats = state.setdefault("stats", {})
+    if stats.get("nodes_alive") != fresh_alive:
+        stats["nodes_alive"] = fresh_alive
+        dirty = True
+    if stats.get("nodes_dead") != fresh_dead:
+        stats["nodes_dead"] = fresh_dead
+        dirty = True
+    if stats.get("nodes_completed") != fresh_completed:
+        stats["nodes_completed"] = fresh_completed
+        dirty = True
+    if stats.get("nodes_total") != len(nodes_list):
+        stats["nodes_total"] = len(nodes_list)
+        dirty = True
+
+    return dirty
+
+
 def load_state(root: Path) -> dict[str, Any]:
+    """In-memory schema migration on load. Persistence happens naturally on
+    the next mutate (the next `save_state` writes the migrated form to disk).
+    Direct JSON readers (synthesize_report.py etc.) call `load_state_migrated`
+    below — same migration logic, same in-memory shape.
+    """
     p = state_path(root)
     if not p.exists():
         sys.exit(f"ERROR: no tree found at {p}. Run `tree_state.py init <idea>` first.")
     with p.open() as f:
         state = json.load(f)
-    # v0.1.6 — auto-migrate pre-v0.1.6 trees by backfilling task-type fields.
-    # Trees created before v0.1.6 lack task_type/depends_on/human_only; treat
-    # them as the conservative training default so v0.1.5 behavior is preserved.
-    for n in state.get("nodes", {}).values():
-        n.setdefault("task_type", "mixed" if n.get("kind") == "root" else "training")
-        n.setdefault("depends_on", [])
-        n.setdefault("human_only", False)
+    _migrate_state(state)  # in-memory only; caller's save_state will persist
+    return state
+
+
+def load_state_migrated(root: Path) -> dict[str, Any]:
+    """Public API for read-only callers (synthesize_report.py,
+    signal_detector.py, stale_running_handler.py). Same in-memory migration
+    as load_state but doesn't sys.exit on missing file (raises FileNotFoundError
+    so the caller can decide).
+    """
+    p = state_path(root)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    with p.open() as f:
+        state = json.load(f)
+    _migrate_state(state)
     return state
 
 
@@ -372,13 +464,15 @@ def cmd_add(args) -> None:
             sys.exit(f"ERROR: would exceed max_total_nodes ({constraints['max_total_nodes']}).")
 
         new_id = next_id(state, parent_id)
+        # v0.4.0 P2-新3: sanitize description at write time
+        description = _sanitize_description(args.description or args.title)
         new_node = _build_new_node(
             new_id=new_id,
             parent_id=parent_id,
             depth=parent_node["depth"] + 1,
             kind=args.kind,
-            title=args.title,
-            description=args.description or args.title,
+            title=args.title[:200],
+            description=description,
             task_type=task_type,
             depends_on=depends_on,
             human_only=human_only,
@@ -386,8 +480,13 @@ def cmd_add(args) -> None:
         )
         state["nodes"][new_id] = new_node
         parent_node["children"].append(new_id)
+        # v0.4.0 — go through _apply_status_transition even though pending →
+        # expanded is alive → alive (no counter delta). Consistency rule:
+        # every status change in the codebase routes through one function so
+        # future invariants (audit logs, on-transition hooks) can be added in
+        # one place rather than chased across mutate paths.
         if parent_node["status"] == "pending":
-            parent_node["status"] = "expanded"
+            _apply_status_transition(state, parent_node, "expanded")
         state["stats"]["nodes_total"] += 1
         state["stats"]["nodes_alive"] += 1
         save_state(root, state)
@@ -435,20 +534,59 @@ def parse_kv(items: list[str]) -> dict[str, Any]:
 
 
 def _apply_status_transition(state: dict, node: dict, new_status: str) -> None:
+    """v0.4.0 codex-final P1-7: counter updates are now symmetric. Pre-v0.4
+    only incremented on enter, never decremented on leave — so reopen (dead →
+    pending) left nodes_dead stale, and a future complete (pending → completed)
+    on a previously-dead node would double-count completed. The migration in
+    load_state also recomputes from scratch on every load, so even if a
+    bypassed transition slips through, the next load_state heals it.
+    """
     prev_status = node["status"]
     if new_status == prev_status:
         return
     was_alive = prev_status in ("pending", "expanded", "running")
     now_alive = new_status in ("pending", "expanded", "running")
     node["status"] = new_status
+
+    stats = state.setdefault("stats", {})
+    # alive counter — symmetric
     if was_alive and not now_alive:
-        state["stats"]["nodes_alive"] -= 1
+        stats["nodes_alive"] = stats.get("nodes_alive", 0) - 1
     elif not was_alive and now_alive:
-        state["stats"]["nodes_alive"] += 1
+        stats["nodes_alive"] = stats.get("nodes_alive", 0) + 1
+
+    # dead counter — symmetric (decrement on leave)
     if new_status == "dead" and prev_status != "dead":
-        state["stats"]["nodes_dead"] += 1
+        stats["nodes_dead"] = stats.get("nodes_dead", 0) + 1
+    elif prev_status == "dead" and new_status != "dead":
+        stats["nodes_dead"] = max(0, stats.get("nodes_dead", 0) - 1)
+
+    # completed counter — symmetric (decrement on leave)
     if new_status == "completed" and prev_status != "completed":
-        state["stats"]["nodes_completed"] += 1
+        stats["nodes_completed"] = stats.get("nodes_completed", 0) + 1
+    elif prev_status == "completed" and new_status != "completed":
+        stats["nodes_completed"] = max(0, stats.get("nodes_completed", 0) - 1)
+
+
+DESCRIPTION_MAX_LEN = 5000  # v0.4.0 P2-新3: cap description length
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # tab + newline OK
+
+
+def _sanitize_description(value: str) -> str:
+    """v0.4.0 codex-final P2-新3: strip ASCII control chars and length-cap.
+
+    Goal: a malicious or buggy agent writes `description=...<lots of markdown
+    injection...>` and `synthesize_report.py` happily renders it into
+    FINAL_REPORT.md, manipulating what a Nature reviewer sees. Sanitize at
+    write time so the on-disk state is already clean.
+    """
+    if not isinstance(value, str):
+        return value
+    cleaned = _CONTROL_CHAR_RE.sub("", value)
+    if len(cleaned) > DESCRIPTION_MAX_LEN:
+        cleaned = cleaned[:DESCRIPTION_MAX_LEN] + "\n...[truncated to fit length cap]"
+    return cleaned
 
 
 def cmd_set(args) -> None:
@@ -459,6 +597,19 @@ def cmd_set(args) -> None:
             sys.exit(f"ERROR: node {args.node_id!r} not found.")
         node = state["nodes"][args.node_id]
         updates = parse_kv(args.assignments)
+
+        # v0.4.0 codex-final P2-新3: description is frozen on terminal states.
+        # Once a node is completed or dead, its description appears in
+        # FINAL_REPORT.md — flipping it after the fact rewrites the reviewer-
+        # facing story without showing up as a status change.
+        if "description" in updates and node["status"] in ("completed", "dead", "abandoned"):
+            sys.exit(
+                f"ERROR: description is frozen on terminal-status nodes "
+                f"({node['status']}). The final report references it."
+            )
+        # Sanitize description even on live nodes
+        if "description" in updates and isinstance(updates["description"], str):
+            updates["description"] = _sanitize_description(updates["description"])
 
         # SECURITY: `set` is for non-status mutations only. Status transitions to
         # `completed` or `dead` require dedicated commands that demand proof
@@ -494,9 +645,9 @@ def cmd_running(args) -> None:
         if args.node_id not in state["nodes"]:
             sys.exit(f"ERROR: node {args.node_id!r} not found.")
         node = state["nodes"][args.node_id]
-        if node["status"] not in ("pending", "expanded", "forked", "abandoned"):
+        if node["status"] not in ("pending", "expanded", "abandoned"):
             sys.exit(
-                f"ERROR: can only mark pending/expanded/forked/abandoned nodes as running. "
+                f"ERROR: can only mark pending/expanded/abandoned nodes as running. "
                 f"Current status: {node['status']}"
             )
         _apply_status_transition(state, node, "running")
@@ -531,20 +682,55 @@ def cmd_complete(args) -> None:
     if not validator_path.exists():
         sys.exit(f"ERROR: charter_validator.py not found at {validator_path}")
 
-    # Optional audit nonce — if provided, validator will enforce codex audit
+    # v0.4.0 codex-final P1-新1: codex audit is REQUIRED by default. The
+    # caller must either pass --audit-nonce-file (the normal path) OR
+    # explicitly disable codex with --no-codex-audit (rare admin path,
+    # warned on stderr so it's visible in logs). Pre-v0.4 the flag was
+    # opt-in, which let agents complete branches with only the physical
+    # validator and skip the external audit entirely.
     val_cmd = [
         sys.executable, str(validator_path), str(branch_dir),
         "--task-type", task_type,
     ]
+    codex_required = not args.no_codex_audit
     if args.audit_nonce_file:
         nonce_path = Path(args.audit_nonce_file).resolve()
         if not nonce_path.exists():
             sys.exit(f"ERROR: --audit-nonce-file {nonce_path} not found")
         val_cmd += ["--require-codex-audit", "--audit-nonce-file", str(nonce_path)]
-    elif args.require_codex_audit:
-        sys.exit(
-            "ERROR: --require-codex-audit was passed but no --audit-nonce-file. "
-            "Pass the AUDIT_NONCE file produced before the codex call, or drop both flags."
+    elif codex_required:
+        # Default path: nonce file expected at branch_dir/AUDIT_NONCE
+        fallback_nonce = branch_dir / "AUDIT_NONCE"
+        if not fallback_nonce.exists():
+            sys.exit(
+                "ERROR: codex audit is required by default. Provide "
+                "--audit-nonce-file <path> (the nonce written before the "
+                "codex call) or place AUDIT_NONCE in branch_dir. To "
+                "explicitly skip codex audit (NOT recommended; breaks "
+                "trust-kernel signature 2), pass --no-codex-audit."
+            )
+        val_cmd += ["--require-codex-audit", "--audit-nonce-file", str(fallback_nonce)]
+    else:
+        # v0.4.0 codex-final hardening: --no-codex-audit requires
+        # RESEARCH_TREE_ADMIN_OVERRIDE=1 in the env. Agents running under
+        # autopilot won't have this set; only a human operator running
+        # `RESEARCH_TREE_ADMIN_OVERRIDE=1 tree_state.py complete ... --no-codex-audit`
+        # for test/admin purposes can use this path. The env var is required
+        # because an agent's subprocess inherits orchestrator env by default,
+        # and `RESEARCH_TREE_ADMIN_OVERRIDE` is never set by autopilot.
+        if os.environ.get("RESEARCH_TREE_ADMIN_OVERRIDE") != "1":
+            sys.exit(
+                "ERROR: --no-codex-audit requires RESEARCH_TREE_ADMIN_OVERRIDE=1 "
+                "in the environment. This is an admin/fixture-only escape hatch "
+                "that breaks trust-kernel signature 2 (codex external audit). "
+                "Real autopilot runs MUST do codex audit; if you're testing "
+                "manually, `export RESEARCH_TREE_ADMIN_OVERRIDE=1` first."
+            )
+        sys.stderr.write(
+            "WARN: --no-codex-audit + RESEARCH_TREE_ADMIN_OVERRIDE=1 was used. "
+            "The completion proof will not include external codex audit. "
+            "DONE.md emission will record this as 'unaudited'. NOT acceptable "
+            "for real research; only for admin/test operations.\n"
         )
 
     # Run validator fresh — this is the trust source
@@ -575,17 +761,50 @@ def cmd_complete(args) -> None:
         if args.node_id not in state["nodes"]:
             sys.exit(f"ERROR: node {args.node_id!r} not found.")
         node = state["nodes"][args.node_id]
+        # v0.4.0 codex-final P1-7: refuse to complete from terminal states.
+        # Dead means the branch was prosecuted and lost; flipping it back to
+        # completed via a fresh validator run would erase the death reason
+        # without the operator explicitly running `reopen` first. Completed
+        # → completed is no-op (already completed).
+        if node["status"] in ("dead", "completed", "abandoned"):
+            sys.exit(
+                f"ERROR: cannot complete node in terminal status {node['status']!r}. "
+                f"Run `reopen {args.node_id}` first if you want to retry."
+            )
         _apply_status_transition(state, node, "completed")
         node["score"] = args.score
+        # v0.4.0 codex-final P1-新1: record whether codex audit was part of
+        # the validation chain. synthesize_report.py uses this to decide
+        # whether the node is DONE.md-eligible — unaudited completions can
+        # still be marked completed (for admin/test workflows) but never
+        # promoted to DONE.md (which would mean Lily picks them up as
+        # ready-for-paper).
+        codex_audit_attested = "--require-codex-audit" in val_cmd
         node["completion_proof"] = {
             "validator_report": str(saved_report),
             "validator_report_sha256": proof_sha,
             "validator_verdict": "PASS",
             "validator_invocation": "subprocess",
             "validator_invoked_by": "tree_state.cmd_complete",
+            "codex_audit_attested": codex_audit_attested,
             "completed_at": now_iso(),
         }
+        # v0.4.0 codex-final P1-4: --done-ready CLI flag is a request, not a
+        # promise. It only takes effect when the validator's own evidence
+        # confirms DONE_READY=true in RESULT.md AND KILL_ARGUMENT.md exists
+        # AND every strict rule for this task_type PASSed. The flag alone
+        # cannot conjure done_ready out of nothing.
         if args.done_ready:
+            evidence = report.get("evidence") or {}
+            done_ready_claimed = bool(evidence.get("done_ready_claimed"))
+            if not done_ready_claimed:
+                sys.exit(
+                    "ERROR: --done-ready requested but validator evidence does not "
+                    "include done_ready_claimed=true. The RESULT.md must contain "
+                    "DONE_READY=true AND a KILL_ARGUMENT.md must exist; without "
+                    "those, the CLI flag is a no-op. Either fix the branch or "
+                    "drop --done-ready."
+                )
             node["done_ready"] = True
         node["updated_at"] = now_iso()
         save_state(root, state)
@@ -649,10 +868,10 @@ def cmd_backtrack(args) -> None:
         if args.node_id not in state["nodes"]:
             sys.exit(f"ERROR: node {args.node_id!r} not found.")
         node = state["nodes"][args.node_id]
-        if node["status"] not in ("pending", "running", "expanded", "forked"):
+        if node["status"] not in ("pending", "running", "expanded"):
             sys.exit(
                 f"ERROR: cannot backtrack from status {node['status']!r}; "
-                f"only pending/running/expanded/forked may be set aside."
+                f"only pending/running/expanded may be set aside."
             )
         _apply_status_transition(state, node, "abandoned")
         if args.reason:
@@ -736,7 +955,7 @@ def cmd_suggest_next(args) -> None:
     for nid, n in nodes.items():
         if n.get("junction_audit_id"):
             continue
-        if n["status"] not in ("expanded", "forked"):
+        if n["status"] != "expanded":
             continue
         kids = [nodes.get(c, {}) for c in n.get("children", [])]
         has_completed = any(k.get("status") == "completed" for k in kids)
@@ -792,7 +1011,6 @@ def cmd_suggest_next(args) -> None:
             "pending": sum(1 for n in nodes.values() if n["status"] == "pending"),
             "running": sum(1 for n in nodes.values() if n["status"] == "running"),
             "abandoned": sum(1 for n in nodes.values() if n["status"] == "abandoned"),
-            "forked": sum(1 for n in nodes.values() if n["status"] == "forked"),
         },
     }, indent=2, ensure_ascii=False))
 
@@ -819,7 +1037,6 @@ def cmd_list(args) -> None:
             "running": "►",
             "completed": "✓",
             "dead": "✗",
-            "forked": "⤳",       # v0.2.0 agent-driven sub-fork
             "abandoned": "⏸",     # v0.2.0 set aside (not dead)
         }.get(n["status"], "?")
         print(f"  {marker} [{n['id']:<6}] depth={n['depth']} score={score:>5} {n['kind']:<12} {n['title']}")
@@ -921,7 +1138,8 @@ def cmd_repair_retry(args) -> None:
 def cmd_apply_subtree_fork(args) -> None:
     """v0.2.0 — read .research-tree/branches/<node>/SUBTREE_FORK.md (JSON inside)
     and create the candidate children via the same code path as cmd_add. Then
-    set parent status to `forked` (new in v0.2.0). After this, autopilot
+    set parent status to `expanded` (v0.4.0 — was `forked` in v0.2-v0.3.1).
+    After this, autopilot
     pick-next will find the new children and descend.
 
     SUBTREE_FORK.md format (front-matter optional, JSON body required):
@@ -1000,6 +1218,15 @@ def _do_apply_subtree_fork(args, root: Path, state: dict, parent: dict) -> None:
             f"max_total_nodes={constraints['max_total_nodes']}"
         )
 
+    # v0.4.0 codex-final P2-新4: task_type cross-fork requires human review.
+    # task_types aren't strictly ordered (training/audit/analysis have
+    # different required artifacts, not "more or less strict") but agents
+    # SHOULDN'T self-fork into a task_type they didn't already declare,
+    # because that's a way to dodge the validation schema their parent
+    # promised. `mixed` parent is the explicitly heterogeneous escape
+    # hatch — it accepts any child task_type without review.
+    parent_task_type = parent.get("task_type", "training")
+
     # Two-pass add (same pattern as expand): assign real ids first, then patch deps
     placeholder_to_id: dict[str, str] = {}
     added_ids: list[str] = []
@@ -1010,14 +1237,33 @@ def _do_apply_subtree_fork(args, root: Path, state: dict, parent: dict) -> None:
         task_type = c.get("task_type", "mixed")
         if task_type not in VALID_TASK_TYPES:
             sys.exit(f"ERROR: candidate task_type {task_type!r} not in {sorted(VALID_TASK_TYPES)}")
+        # P2-新4: cross-task_type forks require human_only=true so the operator
+        # sees the schema change before autopilot picks up the child. `mixed`
+        # parent and `root` parent are the explicit-heterogeneous exceptions.
+        if (
+            task_type != parent_task_type
+            and parent_task_type != "mixed"
+            and parent["id"] != "root"
+            and not c.get("human_only", False)
+        ):
+            sys.exit(
+                f"ERROR: SUBTREE_FORK candidate task_type={task_type!r} differs "
+                f"from parent task_type={parent_task_type!r}. Cross-task_type "
+                f"forks are a schema change — set human_only=true on the "
+                f"candidate so the operator reviews before autopilot picks it up. "
+                f"(Use `mixed` for parents that legitimately spawn heterogeneous "
+                f"children.)"
+            )
         new_id = next_id(state, args.node_id)
+        # P2-新3: sanitize description from agent-supplied SUBTREE_FORK.md
+        raw_desc = c.get("description", c.get("title", ""))
         new_node = _build_new_node(
             new_id=new_id,
             parent_id=args.node_id,
             depth=parent["depth"] + 1,
             kind=kind,
-            title=c.get("title", ""),
-            description=c.get("description", c.get("title", "")),
+            title=c.get("title", "")[:200],
+            description=_sanitize_description(raw_desc),
             task_type=task_type,
             depends_on=[],
             human_only=bool(c.get("human_only", False)),
@@ -1051,13 +1297,15 @@ def _do_apply_subtree_fork(args, root: Path, state: dict, parent: dict) -> None:
                 )
         state["nodes"][new_id]["depends_on"] = resolved
 
-    # Mark parent as forked (new v0.2.0 status — distinct from orchestrator expanded)
-    _apply_status_transition(state, parent, "forked")
+    # v0.4.0: parent goes to `expanded` (same as orchestrator expand). The
+    # agent-self-fork lineage is preserved on each child's `spawned_by_agent`
+    # field, no need for a parallel parent status.
+    _apply_status_transition(state, parent, "expanded")
     parent["updated_at"] = now_iso()
     save_state(root, state)
     print(json.dumps({
         "parent_id": args.node_id,
-        "parent_status_now": "forked",
+        "parent_status_now": "expanded",
         "added_ids": added_ids,
         "placeholder_to_id": placeholder_to_id,
     }, indent=2, ensure_ascii=False))
@@ -1161,7 +1409,6 @@ def cmd_tree(args) -> None:
             "running": "►",
             "completed": "✓",
             "dead": "✗",
-            "forked": "⤳",       # v0.2.0 agent-driven sub-fork
             "abandoned": "⏸",     # v0.2.0 set aside (not dead)
         }.get(n["status"], "?")
         score = f" [{n['score']:.2f}]" if n["score"] is not None else ""
@@ -1214,35 +1461,23 @@ def cmd_audit_add(args) -> None:
     print(audit_id)
 
 
-def get_ancestor_pids() -> list[int]:
-    """Walk up the process tree via /proc, returning the chain of ancestor PIDs
-    from self up to (but not including) PID 1.
+def _current_session_id() -> str:
+    """v0.4.0 — replace the v0.1.5 /proc PPid-chain heuristic with an explicit
+    `$RESEARCH_TREE_SESSION_ID` env var. autopilot's entrypoint sets it once
+    per Claude Code session (via uuidgen); every subprocess inherits it.
 
-    Used by session-step to detect 'same Claude Code session'. Bash `$(...)`
-    command substitution spawns a transient subshell, so getppid() varies between
-    consecutive calls — but the long-lived Claude Code main process appears in
-    every call's ancestor chain. Set intersection of ancestor lists between
-    successive invocations is a reliable 'same-session' predicate.
+    Why this replaces get_ancestor_pids():
+    - /proc is Linux-only; PID chain breaks on Mac and WSL
+    - Claude Code restart = main PID changes = old chain code thought it was
+      a new session even when user intent was "continue overnight run"
+    - An env var is 1 line vs 30, has no platform branches, and works
+      across the same range of bash subshells without /proc parsing.
+
+    Default `default` slug ensures a single CLI invocation outside autopilot
+    still gets a stable id during that one process — but if the var is unset
+    autopilot will assign a fresh uuid for true "new session" semantics.
     """
-    pids: list[int] = []
-    pid = os.getpid()
-    seen: set[int] = {pid}
-    while pid > 1:
-        try:
-            with open(f"/proc/{pid}/status") as f:
-                ppid: int | None = None
-                for line in f:
-                    if line.startswith("PPid:"):
-                        ppid = int(line.split()[1])
-                        break
-            if ppid is None or ppid <= 1 or ppid in seen:
-                break
-            pids.append(ppid)
-            seen.add(ppid)
-            pid = ppid
-        except (OSError, ValueError):
-            break
-    return pids
+    return os.environ.get("RESEARCH_TREE_SESSION_ID", "default")
 
 
 def _gate_path(root: Path) -> Path:
@@ -1277,14 +1512,14 @@ def _write_human_gate(root: Path, reason: str, *, overwrite: bool = False) -> bo
 
 def cmd_session_step(args) -> None:
     """Track how many autopilot steps have run within the current Claude Code
-    session. Detects 'same session' by ancestor-PID-chain intersection (robust
-    against transient subshell PIDs from bash `$()` substitution). When count
-    exceeds `--threshold`, reports `should_pause=true` so autopilot stops and
-    asks the user to restart the session for a clean context window.
+    session. v0.4.0: same-session is determined by `$RESEARCH_TREE_SESSION_ID`
+    env var (set once per session by autopilot's entrypoint). Replaces the
+    v0.1.5 /proc PPid-chain heuristic which was Linux-only and misfired on
+    Claude Code restarts.
 
     Stored in `.research-tree/session_step.json`:
         {
-          "ancestor_pids": [<pid>, ...],   # process tree up at first call
+          "session_id": "<uuid or 'default'>",
           "count": <int>,
           "started_at": <iso>,
           "last_step_at": <iso>
@@ -1294,34 +1529,47 @@ def cmd_session_step(args) -> None:
     state_dir = root / STATE_DIR_NAME
     state_dir.mkdir(parents=True, exist_ok=True)
     p = state_dir / "session_step.json"
-    current_ancestors = get_ancestor_pids()
+    current_session_id = _current_session_id()
 
+    # v0.4.0 codex-final P1-6: tolerant load. session_step.json might be hand-
+    # edited, truncated mid-write, or contain bogus types. Coerce to safe dict
+    # rather than crash. Worst case we treat session as new and reset count.
     prev: dict[str, Any] = {}
     if p.exists():
         try:
-            prev = json.loads(p.read_text())
-        except json.JSONDecodeError:
+            raw = json.loads(p.read_text())
+            if isinstance(raw, dict):
+                prev = raw
+        except (json.JSONDecodeError, OSError):
             prev = {}
 
-    prev_ancestors = prev.get("ancestor_pids", []) or []
-    same_session = bool(set(current_ancestors) & set(prev_ancestors))
+    # v0.4.0 migration: an older session_step.json carries `ancestor_pids` but
+    # no `session_id`. Treat it as "different session" so the counter resets
+    # cleanly on the first v0.4.0 invocation rather than chaining stale state.
+    prev_session_id = prev.get("session_id") if isinstance(prev.get("session_id"), str) else None
+    same_session = prev_session_id is not None and prev_session_id == current_session_id
+
+    # P1-6 — type-coerce count: if it was hand-written as "x" or [], treat
+    # as 0. Negative counts make no sense; clamp.
+    prev_count_raw = prev.get("count", 0)
+    prev_count = prev_count_raw if isinstance(prev_count_raw, int) and prev_count_raw >= 0 else 0
+
+    prev_started_raw = prev.get("started_at")
+    prev_started = prev_started_raw if isinstance(prev_started_raw, str) else None
 
     if args.action == "report":
-        count = prev.get("count", 0) if same_session else 0
+        count = prev_count if same_session else 0
         action_taken = "report"
     elif args.action == "increment":
         if same_session:
-            count = prev.get("count", 0) + 1
-            started = prev.get("started_at", now_iso())
-            # Union ancestors so we keep accumulating known session pids
-            merged_ancestors = sorted(set(prev_ancestors) | set(current_ancestors))
+            count = prev_count + 1
+            started = prev_started if prev_started is not None else now_iso()
         else:
             count = 1
             started = now_iso()
-            merged_ancestors = current_ancestors
         action_taken = "increment"
         payload = {
-            "ancestor_pids": merged_ancestors,
+            "session_id": current_session_id,
             "count": count,
             "started_at": started,
             "last_step_at": now_iso(),
@@ -1353,7 +1601,7 @@ def cmd_session_step(args) -> None:
         )
 
     out = {
-        "ancestor_pids_sampled": current_ancestors,
+        "session_id": current_session_id,
         "same_session_as_last_call": same_session,
         "count": count,
         "threshold": threshold,
@@ -1427,6 +1675,25 @@ def cmd_human_gate(args) -> int:
         return 0
 
     sys.exit(f"ERROR: unknown action {args.action!r}")
+
+
+def cmd_migrate(args) -> None:
+    """v0.4.0 codex-final P1-3 — explicit on-disk migration. Loads tree.json,
+    runs all migration helpers, persists the result if anything changed.
+    Idempotent. Use this once after upgrading the tool, or whenever you
+    suspect direct JSON readers diverged from the canonical schema.
+    """
+    root = Path(args.project_root).resolve()
+    p = state_path(root)
+    if not p.exists():
+        sys.exit(f"ERROR: no tree found at {p}")
+    with state_lock(root):
+        with p.open() as f:
+            state = json.load(f)
+        dirty = _migrate_state(state)
+        if dirty:
+            save_state(root, state)
+    print(json.dumps({"migrated": dirty, "path": str(p)}, indent=2))
 
 
 def cmd_budget_check(args) -> None:
@@ -1521,13 +1788,21 @@ def main() -> None:
     p_complete.add_argument(
         "--audit-nonce-file",
         default=None,
-        help="if provided, pass to charter_validator as --audit-nonce-file (enforces "
-             "codex audit nonce + SHA256 cross-check).",
+        help="v0.4.0: nonce file path (codex audit is now REQUIRED by default; "
+             "this flag tells the validator where to find it).",
     )
     p_complete.add_argument(
         "--require-codex-audit",
         action="store_true",
-        help="require codex audit; must be paired with --audit-nonce-file.",
+        help="v0.4.0 deprecated — codex audit is now required by default. "
+             "Kept as a no-op for backward compat.",
+    )
+    p_complete.add_argument(
+        "--no-codex-audit",
+        action="store_true",
+        help="v0.4.0: explicitly skip codex audit. NOT recommended — breaks "
+             "trust-kernel signature 2. Only for admin operations / test "
+             "fixtures. Warning is printed to stderr.",
     )
     p_complete.add_argument(
         "--done-ready",
@@ -1594,7 +1869,7 @@ def main() -> None:
     p_fork = sub.add_parser(
         "apply-subtree-fork",
         help="read .research-tree/branches/<id>/SUBTREE_FORK.md and create the "
-             "candidate children listed inside. Parent becomes status=forked.",
+             "candidate children listed inside. Parent becomes status=expanded.",
     )
     p_fork.add_argument("node_id")
     p_fork.set_defaults(func=cmd_apply_subtree_fork)
@@ -1635,6 +1910,13 @@ def main() -> None:
     p_audit.add_argument("verdict")
     p_audit.add_argument("--trace-file", default=None)
     p_audit.set_defaults(func=cmd_audit_add)
+
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="v0.4.0 — run migration helpers and persist if any schema changed "
+             "(forked → expanded, drop dead fields, recompute stats counters)",
+    )
+    p_migrate.set_defaults(func=cmd_migrate)
 
     p_budget = sub.add_parser("budget-check", help="exit 1 if any budget exceeded")
     p_budget.set_defaults(func=cmd_budget_check)

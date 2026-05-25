@@ -526,10 +526,62 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
             f"task_type={task_type}: {sorted(missing_required)}"
         )
         return
+    # v0.4.0 codex-final P1-新2: files_read keys are model-controlled. Without
+    # path-safety filtering, the model could put "/dev/zero" (sha256_file blocks
+    # forever) or "../../../etc/passwd" (read outside branch_dir). Restrict to
+    # entries in required_files set + ban absolute / dot-dot paths + verify
+    # the resolved path stays inside branch_dir + require regular file.
+    import os as _os
+    import stat as _stat
+    branch_dir_resolved = branch_dir.resolve()
     for rel_path, claimed_sha in files_read.items():
+        if rel_path not in required_files:
+            failures.append(
+                f"CODEX_AUDIT.json: files_read references {rel_path!r} which is "
+                f"not in the required-files set for task_type={task_type}. Refusing."
+            )
+            continue
+        rel_p = Path(rel_path)
+        if rel_p.is_absolute() or ".." in rel_p.parts:
+            failures.append(
+                f"CODEX_AUDIT.json: files_read path {rel_path!r} unsafe "
+                f"(absolute or contains '..')"
+            )
+            continue
         actual_file = branch_dir / rel_path
-        if not actual_file.exists():
-            failures.append(f"CODEX_AUDIT.json: claims to have read {rel_path} but file does not exist")
+        try:
+            actual_resolved = actual_file.resolve()
+        except OSError as e:
+            failures.append(f"CODEX_AUDIT.json: files_read path {rel_path}: {e}")
+            continue
+        # Resolved path must stay inside branch_dir (symlink escape guard)
+        try:
+            actual_resolved.relative_to(branch_dir_resolved)
+        except ValueError:
+            failures.append(
+                f"CODEX_AUDIT.json: files_read path {rel_path} resolves to "
+                f"{actual_resolved}, outside branch_dir {branch_dir_resolved}. "
+                f"Symlink escape or path injection."
+            )
+            continue
+        try:
+            st = _os.lstat(str(actual_file))
+        except OSError as e:
+            failures.append(f"CODEX_AUDIT.json: lstat {rel_path}: {e}")
+            continue
+        if not _stat.S_ISREG(st.st_mode):
+            failures.append(
+                f"CODEX_AUDIT.json: files_read path {rel_path} is not a regular "
+                f"file (mode={oct(st.st_mode)}). Refusing to sha256 it — could "
+                f"be /dev/zero, a fifo, or a symlink to anything."
+            )
+            continue
+        if st.st_size > 200 * 1024 * 1024:  # 200 MB sanity cap
+            failures.append(
+                f"CODEX_AUDIT.json: files_read path {rel_path} is "
+                f"{st.st_size} bytes — refusing to sha256 (would tie up the "
+                f"validator). Audit pipeline should not be feeding huge files."
+            )
             continue
         actual_sha = sha256_file(actual_file)
         if actual_sha != str(claimed_sha).strip():
@@ -537,6 +589,162 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
                 f"CODEX_AUDIT.json: SHA256 mismatch for {rel_path} — codex claims "
                 f"{claimed_sha}, actual {actual_sha}. File changed after audit, or audit fake?"
             )
+
+    # v0.4.0 — challenge-fragment cross-check (real anti-fabrication).
+    # codex_audit_cli.py writes a SANITIZED AUDIT_CHALLENGES.json AFTER the
+    # codex call: {challenge_id: {file, offset, length}}. Crucially, the
+    # file does NOT contain expected_text — that would let an agent read
+    # its own branch_dir, copy the answers, and fabricate a CODEX_AUDIT.json
+    # without ever calling codex.
+    #
+    # Validator's job:
+    #   1. Read sanitized challenges.
+    #   2. Re-read disk at (file, offset, length) to derive expected_text fresh.
+    #   3. Compare against CODEX_AUDIT.json.challenge_responses byte-for-byte.
+    # The disk read at step 2 is the ground truth: it's what the model saw
+    # inline at audit time (assuming files haven't been edited between audit
+    # and validation — that case is caught by the SHA cross-check above).
+    #
+    # v0.4.0 codex-final P1-2: enforce coverage. Each required_file must have
+    # exactly N_REQUIRED_CHALLENGES_PER_FILE challenges (default 3), each 64
+    # bytes (unless the file is shorter than 64 bytes), all referencing
+    # relative paths inside branch_dir (reject absolute / dot-dot paths).
+    challenges_path = branch_dir / "AUDIT_CHALLENGES.json"
+    if not challenges_path.exists():
+        failures.append(
+            "AUDIT_CHALLENGES.json: missing — codex_audit_cli (v0.4.0+) writes "
+            "this after a successful codex call. Either the audit was run with "
+            "a pre-v0.4.0 tool (regenerate the audit) or the file was deleted "
+            "to bypass the challenge-fragment check."
+        )
+        return
+    try:
+        challenges = json.loads(challenges_path.read_text())
+    except json.JSONDecodeError as e:
+        failures.append(f"AUDIT_CHALLENGES.json: invalid JSON ({e})")
+        return
+    if not isinstance(challenges, dict) or not challenges:
+        failures.append("AUDIT_CHALLENGES.json: empty or not a dict")
+        return
+    responses = audit.get("challenge_responses")
+    if not isinstance(responses, dict) or not responses:
+        failures.append(
+            "CODEX_AUDIT.json: 'challenge_responses' missing or not a dict. "
+            "v0.4.0 requires the model to quote verbatim fragments at random "
+            "byte offsets of each required file. Re-run the audit with the "
+            "current codex_audit_cli.py."
+        )
+        return
+
+    # P1-2 — count challenges per required file. Each must have exactly 3
+    # (matches codex_audit_cli.py N_CHALLENGES_PER_FILE).
+    N_REQUIRED_CHALLENGES_PER_FILE = 3
+    CHALLENGE_FRAGMENT_BYTES = 64
+    challenges_per_file: dict[str, int] = {f: 0 for f in required_files}
+
+    # P1-1 prep: load file contents once for re-derivation
+    file_contents_cache: dict[str, str] = {}
+    for rel in required_files:
+        p = branch_dir / rel
+        if p.exists():
+            try:
+                file_contents_cache[rel] = p.read_text(errors="replace")
+            except OSError:
+                pass  # already complained above
+
+    challenge_evidence: dict[str, str] = {}
+    for cid, ch in challenges.items():
+        rel = ch.get("file") if isinstance(ch, dict) else None
+        offset = ch.get("offset") if isinstance(ch, dict) else None
+        length = ch.get("length") if isinstance(ch, dict) else None
+        if rel is None or offset is None or length is None:
+            failures.append(
+                f"AUDIT_CHALLENGES.json: challenge {cid!r} malformed "
+                f"(needs file, offset, length — no expected_text since v0.4.0)"
+            )
+            continue
+        # P1-2 — refuse absolute, dot-dot, or non-required-file challenges.
+        # Path injection or out-of-scope reads must not pass.
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            failures.append(
+                f"AUDIT_CHALLENGES.json: challenge {cid} references unsafe "
+                f"path {rel!r} (absolute or contains '..')"
+            )
+            continue
+        if rel not in required_files:
+            failures.append(
+                f"AUDIT_CHALLENGES.json: challenge {cid} references {rel!r} "
+                f"which is not in the required-files set for task_type={task_type}"
+            )
+            continue
+        # P1-2 — enforce CHALLENGE_FRAGMENT_BYTES unless file is shorter
+        disk_content = file_contents_cache.get(rel)
+        if disk_content is None:
+            failures.append(
+                f"AUDIT_CHALLENGES.json: challenge {cid} references {rel} "
+                f"which does not exist on disk now"
+            )
+            continue
+        if length != CHALLENGE_FRAGMENT_BYTES and length != len(disk_content):
+            failures.append(
+                f"AUDIT_CHALLENGES.json: challenge {cid} length={length} "
+                f"must be {CHALLENGE_FRAGMENT_BYTES} (or file length if smaller)"
+            )
+            continue
+        if not isinstance(offset, int) or offset < 0 or offset + length > len(disk_content):
+            failures.append(
+                f"AUDIT_CHALLENGES.json: challenge {cid} offset={offset} + "
+                f"length={length} out of bounds for {rel} (size={len(disk_content)})"
+            )
+            continue
+
+        challenges_per_file[rel] = challenges_per_file.get(rel, 0) + 1
+
+        # P1-1 — re-derive expected_text from disk (ground truth at validation
+        # time); the model's quote must match. If files changed since audit
+        # was generated, the SHA cross-check above already caught that.
+        expected_text = disk_content[offset:offset + length]
+        model_response = responses.get(cid)
+        if not isinstance(model_response, str):
+            failures.append(
+                f"CODEX_AUDIT.json: challenge_responses[{cid!r}] missing or "
+                f"not a string. Model failed to quote the fragment."
+            )
+            continue
+        # Strict byte-for-byte. LLMs sometimes drop or add whitespace; for
+        # 64-byte fragments the model has no excuse — it must copy from the
+        # inlined content verbatim. Any normalization here would be a hole.
+        if model_response != expected_text:
+            failures.append(
+                f"CODEX_AUDIT.json: challenge {cid} ({rel} bytes "
+                f"[{offset}..{offset + length})) — model quoted "
+                f"{model_response[:80]!r}, disk has {expected_text[:80]!r}. "
+                f"Mismatch means the model fabricated the audit without "
+                f"reading the inlined file."
+            )
+            continue
+        challenge_evidence[cid] = "match"
+
+    # P1-2 — enforce coverage: every required file must have N challenges.
+    # If the file is shorter than 64 bytes, 1 challenge (whole file) suffices.
+    for rel in required_files:
+        n = challenges_per_file.get(rel, 0)
+        content_len = len(file_contents_cache.get(rel, ""))
+        required_n = 1 if content_len < CHALLENGE_FRAGMENT_BYTES else N_REQUIRED_CHALLENGES_PER_FILE
+        if n != required_n:
+            failures.append(
+                f"AUDIT_CHALLENGES.json: required file {rel!r} has {n} "
+                f"challenges, expected exactly {required_n}. "
+                f"Coverage shortfall would let the agent answer only easy "
+                f"challenges and skip hard files."
+            )
+
+    evidence["challenge_fragments"] = {
+        "total": len(challenges),
+        "matched": sum(1 for v in challenge_evidence.values() if v == "match"),
+        "per_file": challenges_per_file,
+    }
 
 
 def check_done_ready(

@@ -227,7 +227,10 @@ cat > "$B/CODEX_AUDIT.json" <<EOF
 EOF
 expect_exit "codex audit without nonce now FAILs" 2 "$B" --require-codex-audit
 
-echo "=== test 16b: --require-codex-audit + nonce + sha cross-check passes ==="
+echo "=== test 16b: --require-codex-audit + nonce + sha + challenge-fragment passes ==="
+# v0.4.0 — validator now also enforces AUDIT_CHALLENGES.json + the model's
+# challenge_responses must verbatim-match disk bytes at random offsets.
+# Construct a real challenge set + matching responses for the perfect branch.
 B="$TMP/audit_pass"
 build_perfect_branch "$B"
 NONCE16="real-nonce-test16b"
@@ -235,11 +238,103 @@ echo "$NONCE16" > "$B/AUDIT_NONCE"
 RESULT_SHA=$(sha256sum "$B/RESULT.md" | awk '{print $1}')
 METRICS_SHA=$(sha256sum "$B/metrics.json" | awk '{print $1}')
 SPLIT_SHA=$(sha256sum "$B/data/test_split.json" | awk '{print $1}')
+
+# Generate 3 challenges per file (matches codex_audit_cli.py defaults).
+python3 <<PYGEN
+import hashlib, json, random
+from pathlib import Path
+B = Path("$B")
+files = ["RESULT.md", "metrics.json", "data/test_split.json"]
+contents = {f: (B / f).read_text(errors="replace") for f in files}
+rng = random.Random("$NONCE16")
+challenges = {}
+responses = {}
+FRAG = 64
+for f in files:
+    c = contents[f]
+    if len(c) < FRAG:
+        challenges[f"ch_{f}_0"] = {"file": f, "offset": 0, "length": len(c), "expected_text": c}
+        responses[f"ch_{f}_0"] = c
+        continue
+    for i in range(3):
+        offset = rng.randint(0, len(c) - FRAG)
+        frag = c[offset:offset + FRAG]
+        challenges[f"ch_{f}_{i}"] = {"file": f, "offset": offset, "length": FRAG, "expected_text": frag}
+        responses[f"ch_{f}_{i}"] = frag
+(B / "AUDIT_CHALLENGES.json").write_text(json.dumps(challenges, indent=2, ensure_ascii=False))
+audit = {
+    "nonce": "$NONCE16",
+    "verdict": "PASS",
+    "reasoning_summary": "Honest, well-instrumented branch.",
+    "files_read": {
+        "RESULT.md": "$RESULT_SHA",
+        "metrics.json": "$METRICS_SHA",
+        "data/test_split.json": "$SPLIT_SHA",
+    },
+    "challenge_responses": responses,
+}
+(B / "CODEX_AUDIT.json").write_text(json.dumps(audit, indent=2, ensure_ascii=False))
+PYGEN
+
+expect_exit "codex verdict=PASS with nonce + sha + challenge fragments passes" 0 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
+
+echo "=== test 16c: challenge-fragment mismatch FAILs (v0.4.0) ==="
+# Build a branch where CODEX_AUDIT.json has correct nonce + sha but the
+# challenge_responses are fabricated — model "passed audit" without reading.
+B="$TMP/audit_frag_fake"
+build_perfect_branch "$B"
+NONCE_FRAG="frag-test-nonce"
+echo "$NONCE_FRAG" > "$B/AUDIT_NONCE"
+RESULT_SHA=$(sha256sum "$B/RESULT.md" | awk '{print $1}')
+METRICS_SHA=$(sha256sum "$B/metrics.json" | awk '{print $1}')
+SPLIT_SHA=$(sha256sum "$B/data/test_split.json" | awk '{print $1}')
+# Write challenges based on actual file content (orchestrator-side honest)
+python3 <<PYGEN
+import json, random
+from pathlib import Path
+B = Path("$B")
+content = (B / "RESULT.md").read_text(errors="replace")
+rng = random.Random("$NONCE_FRAG")
+FRAG = 64
+offset = rng.randint(0, len(content) - FRAG)
+challenges = {
+    "ch_RESULT.md_0": {"file": "RESULT.md", "offset": offset, "length": FRAG,
+                       "expected_text": content[offset:offset + FRAG]}
+}
+(B / "AUDIT_CHALLENGES.json").write_text(json.dumps(challenges, indent=2, ensure_ascii=False))
+PYGEN
+# Model's response is fabricated — doesn't match the random fragment
 cat > "$B/CODEX_AUDIT.json" <<EOF
 {
-  "nonce": "$NONCE16",
+  "nonce": "$NONCE_FRAG",
   "verdict": "PASS",
-  "reasoning_summary": "Honest, well-instrumented branch.",
+  "reasoning_summary": "Looks fine.",
+  "files_read": {
+    "RESULT.md": "$RESULT_SHA",
+    "metrics.json": "$METRICS_SHA",
+    "data/test_split.json": "$SPLIT_SHA"
+  },
+  "challenge_responses": {
+    "ch_RESULT.md_0": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }
+}
+EOF
+expect_exit "fabricated challenge fragment FAILs" 2 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
+
+echo "=== test 16d: AUDIT_CHALLENGES.json missing FAILs (v0.4.0) ==="
+# Construct everything except AUDIT_CHALLENGES.json — old format would PASS,
+# v0.4.0 must FAIL because the challenge cross-check is now mandatory.
+B="$TMP/audit_no_challenges"
+build_perfect_branch "$B"
+NONCE_NC="no-challenges-nonce"
+echo "$NONCE_NC" > "$B/AUDIT_NONCE"
+RESULT_SHA=$(sha256sum "$B/RESULT.md" | awk '{print $1}')
+METRICS_SHA=$(sha256sum "$B/metrics.json" | awk '{print $1}')
+SPLIT_SHA=$(sha256sum "$B/data/test_split.json" | awk '{print $1}')
+cat > "$B/CODEX_AUDIT.json" <<EOF
+{
+  "nonce": "$NONCE_NC",
+  "verdict": "PASS",
   "files_read": {
     "RESULT.md": "$RESULT_SHA",
     "metrics.json": "$METRICS_SHA",
@@ -247,7 +342,7 @@ cat > "$B/CODEX_AUDIT.json" <<EOF
   }
 }
 EOF
-expect_exit "codex verdict=PASS with nonce + sha cross-check passes" 0 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
+expect_exit "missing AUDIT_CHALLENGES.json FAILs in v0.4.0" 2 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
 
 echo "=== test 17: DONE_READY=true + missing KILL_ARGUMENT.md fails ==="
 B="$TMP/done_no_kill"
@@ -354,7 +449,7 @@ cat > "$B/CODEX_AUDIT.json" <<EOF
 EOF
 expect_exit "missing files_read fails when nonce mode enabled" 2 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
 
-echo "=== test 26: correct nonce + correct sha passes ==="
+echo "=== test 26: correct nonce + correct sha + correct challenge fragments passes ==="
 B="$TMP/audit_legit"
 build_perfect_branch "$B"
 NONCE="real-nonce-deadbeef"
@@ -362,19 +457,42 @@ echo "$NONCE" > "$B/AUDIT_NONCE"
 RESULT_SHA=$(sha256sum "$B/RESULT.md" | awk '{print $1}')
 METRICS_SHA=$(sha256sum "$B/metrics.json" | awk '{print $1}')
 SPLIT_SHA=$(sha256sum "$B/data/test_split.json" | awk '{print $1}')
-cat > "$B/CODEX_AUDIT.json" <<EOF
-{
-  "nonce": "$NONCE",
-  "verdict": "PASS",
-  "reasoning_summary": "actually inspected files",
-  "files_read": {
-    "RESULT.md": "$RESULT_SHA",
-    "metrics.json": "$METRICS_SHA",
-    "data/test_split.json": "$SPLIT_SHA"
-  }
+# v0.4.0 — full pipeline needs AUDIT_CHALLENGES.json + matching responses
+python3 <<PYGEN
+import json, random
+from pathlib import Path
+B = Path("$B")
+files = ["RESULT.md", "metrics.json", "data/test_split.json"]
+contents = {f: (B / f).read_text(errors="replace") for f in files}
+rng = random.Random("$NONCE")
+challenges, responses = {}, {}
+FRAG = 64
+for f in files:
+    c = contents[f]
+    if len(c) < FRAG:
+        challenges[f"ch_{f}_0"] = {"file": f, "offset": 0, "length": len(c), "expected_text": c}
+        responses[f"ch_{f}_0"] = c
+        continue
+    for i in range(3):
+        offset = rng.randint(0, len(c) - FRAG)
+        frag = c[offset:offset + FRAG]
+        challenges[f"ch_{f}_{i}"] = {"file": f, "offset": offset, "length": FRAG, "expected_text": frag}
+        responses[f"ch_{f}_{i}"] = frag
+(B / "AUDIT_CHALLENGES.json").write_text(json.dumps(challenges, indent=2, ensure_ascii=False))
+audit = {
+    "nonce": "$NONCE",
+    "verdict": "PASS",
+    "reasoning_summary": "actually inspected files",
+    "files_read": {
+        "RESULT.md": "$RESULT_SHA",
+        "metrics.json": "$METRICS_SHA",
+        "data/test_split.json": "$SPLIT_SHA",
+    },
+    "challenge_responses": responses,
 }
-EOF
-expect_exit "legitimate nonce + sha passes" 0 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
+(B / "CODEX_AUDIT.json").write_text(json.dumps(audit, indent=2, ensure_ascii=False))
+PYGEN
+expect_exit "legitimate nonce + sha + challenges passes" 0 "$B" --require-codex-audit --audit-nonce-file "$B/AUDIT_NONCE"
 
 echo
 echo "PASS — all charter_validator.py smoke tests green."

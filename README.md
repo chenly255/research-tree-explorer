@@ -16,6 +16,10 @@ You hit `/research-tree init "<your idea>"`, walk away, and come back to `FINAL_
 
 **v0.1.6 — task-type-aware nodes**: a tree branch can now declare what KIND of work it does — `training` (default, v0.1.5 behavior, needs checkpoints + ablations), `audit` (post-hoc evaluation on a frozen model, needs `audit_report.json` + `donor_bootstrap.json` + `protocol_comparison.json` instead), `analysis` (figures + statistics), `data-acquisition` (downloaded atlas with checksum-verified manifest), or `framing-decision` (paper-writing / venue choice — `human_only`, autopilot skips entirely). The validator routes on `task_type` and applies the appropriate physical-artifact schema, so audit-style projects no longer auto-FAIL because they have no checkpoints. Nodes can also declare `depends_on` to express sequencing (a repair-head training branch depends on the audit that named its target blindspot); `pick-next` skips nodes with unmet dependencies. Old trees and old validator invocations are unchanged in behavior — `task_type` defaults to `training`.
 
+**v0.3.1 — trust kernel hardening**: a Linus-style code review + an independent codex blind audit caught 7 issues including 2 P0 trust-kernel bypasses Claude self-review missed. `cmd_complete` now re-runs `charter_validator` as a subprocess on `branch_dir` instead of accepting any user-supplied PASS JSON. `--require-codex-audit` mandatorily pairs with a nonce file (was silently skipping the SHA cross-check before). `test_split.json` hash and `DATA_MANIFEST.json` checksum are now genuinely recomputed, not just checked for field existence. State_lock uses `O_NOFOLLOW`. `apply_subtree_fork` enforces budgets (used to be entirely outside the budget check). PID liveness checks include `/proc/<pid>/stat` starttime to detect PID reuse.
+
+**v0.4.0 — quality-first cleanup**: closes every "known limitation" v0.3.1 left open. The codex audit (SHA-echo) is replaced with a challenge-fragment scheme: orchestrator writes random `(file, byte_offset, length)` windows to `AUDIT_CHALLENGES.json` *before* the model is called; model must quote each window verbatim; validator re-reads disk and cross-checks byte-for-byte. The model cannot fake having read the inlined content. The `forked` status is unified into `expanded` (state count 7→6); the v0.2.0-v0.3.1 lineage info now lives on each child's `spawned_by_agent` field. Same-session detection uses `$RESEARCH_TREE_SESSION_ID` env var (set once per Claude Code session by autopilot) instead of walking `/proc` PPid chains — cross-platform, IDE-restart safe. `synthesize_report.py` no longer drops `abandoned` nodes from FINAL_REPORT.md.
+
 ---
 
 ## What this is, in one diagram
@@ -255,8 +259,8 @@ LLMs are good at *claiming* compliance and bad at *delivering* it under pressure
    - This blocks the "subagent pre-writes `CODEX_AUDIT.json` with `verdict: PASS`" bypass
 
 3. **Status state machine locked**:
-   - `tree_state.py set` refuses to write `status=` at all. Status transitions go through dedicated commands: `complete --validator-report X --score Y` (refuses unless validator report verdict=PASS), `die --reason X`, `running`, `reopen`
-   - `complete` records the SHA256 of the validator report as `completion_proof` on the node; later forgery of the report is detectable
+   - `tree_state.py set` refuses to write `status=` at all. Status transitions go through dedicated commands: `complete --score Y --audit-nonce-file ... --require-codex-audit` (v0.3.1+: re-runs `charter_validator` as subprocess on `branch_dir` — user-supplied JSON is no longer accepted as proof), `die --reason X`, `running`, `reopen`, `backtrack`, `resume-branch`
+   - `complete` records the SHA256 of the freshly-generated validator report as `completion_proof` on the node; the validator report is regenerated from disk on every call, so a stale or forged report does not survive the next `complete` invocation
    - `synthesize_report.py` requires `completion_proof` (not just `status=completed`) to trigger DONE.md, so flipping `done_ready` in tree.json alone is not enough
 
 4. **Fail-CLOSED when codex unavailable**: if the codex MCP doesn't respond, the branch is `die`d with `death_reason="external_audit_unavailable"`. Never fail-open. Codex MCP is a HARD dependency for v0.1.3.

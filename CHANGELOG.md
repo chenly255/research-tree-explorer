@@ -2,6 +2,138 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4.0] — 2026-05-25
+
+Quality-first release: closes every "known limitation" the v0.3.1 release left
+open. Triggered by user instruction "不要留尾巴 / 以质量为第一目标". Three v0.3.2
+deferreds plus the broader cleanup are all done; no new "deferred to v0.4.1"
+items in this changelog.
+
+This release went through **three rounds of independent codex audits** in
+addition to the Linus-style Claude self-review. Round 2 caught 2 P0 trust-
+kernel bypasses Claude missed (the documented "AI self-review blind spot"
+pattern). Round 3 caught 2 P1 trust-kernel bypasses Claude introduced *while
+fixing Round 2*, plus 4 P2 regressions in the new code. All findings from
+all three rounds are addressed in this release. Pattern documented in
+`memory/decisions.md` v0.4.0 entry for future tool-change workflows.
+
+### Added — defenses against codex Round 3 findings (P1 + P2)
+
+- **`cmd_complete` requires codex audit by default + admin-gated escape hatch**
+  (Round 3 P1-新1). Pre-fix, `--audit-nonce-file` was optional; without it the
+  entire external audit could be skipped. Now: codex audit is required; the
+  caller passes `--audit-nonce-file <path>` (or places `AUDIT_NONCE` in the
+  branch dir) OR explicitly uses `--no-codex-audit` AND sets
+  `RESEARCH_TREE_ADMIN_OVERRIDE=1` in the env (the env var requirement stops
+  an agent's subprocess from passing the flag on its own). Unaudited
+  completions are still possible for admin/test workflows but are tagged
+  `codex_audit_attested=False` in `completion_proof` and rejected by
+  `synthesize_report.py` when deciding DONE.md eligibility.
+- **`files_read` path-safety filter** (Round 3 P1-新2). Validator was iterating
+  whatever paths the model wrote into `audit["files_read"]` and calling
+  `sha256_file` on them — `"/dev/zero"` would block forever; `"../../etc/passwd"`
+  would read outside branch_dir. Now: path must be in `required_files`, must
+  not be absolute, must not contain `..`, must resolve to inside `branch_dir`
+  (`relative_to` check catches symlink escapes), must be a regular file
+  (`S_ISREG`), must be ≤ 200 MB.
+- **`atomic_write` for audit artifacts** (Round 3 P2-新1). `CODEX_AUDIT.json` and
+  `AUDIT_CHALLENGES.json` now use temp-file + `fsync` + `os.replace`. A
+  disk-full or `kill -9` during write no longer leaves a half-truncated JSON
+  for the validator to choke on.
+- **`death_reason` / `death_evidence` no longer in `SET_ALLOWED_KEYS`** (Round 3
+  P2-新2). Pre-fix, an agent could rewrite a dead node's reason after the fact —
+  audit history tampering. Now set-once at `die` time, never editable.
+- **`_sanitize_description`** (Round 3 P2-新3). Descriptions are stripped of
+  ASCII control characters (`\\x00-\\x08`, `\\x0b-\\x1f`, `\\x7f`) and capped
+  at 5000 chars. `cmd_set` refuses to change description on terminal-status
+  nodes (completed/dead/abandoned) — the description shows up in
+  FINAL_REPORT.md, post-hoc edits rewrite the reviewer-facing story.
+- **`SUBTREE_FORK` cross-task_type guard** (Round 3 P2-新4). An agent forking
+  itself into children with a different `task_type` (e.g. "training" parent
+  spawning "audit" child to dodge the checkpoint requirement) must set
+  `human_only=true` on each cross-type candidate, forcing operator review.
+  `mixed` parents and root are explicit-heterogeneous exceptions.
+
+### Added — defenses against codex Round 2 findings (P1)
+
+### Added — defenses against codex Round 2 findings (P1) — challenge-fragment is now genuinely tamper-resistant
+
+### Added — real anti-fabrication (challenge-fragment scheme)
+- `codex_audit_cli.py` now generates `AUDIT_CHALLENGES.json` before invoking
+  the model. Each required file gets N random (file, byte_offset, length=64)
+  windows. The prompt asks the model to quote each window verbatim. The model
+  cannot answer challenges from prompt structure alone — it must actually
+  parse the inlined file content.
+- `charter_validator.check_codex_audit` reads `AUDIT_CHALLENGES.json` and the
+  model's `challenge_responses` in `CODEX_AUDIT.json`, re-reads disk at each
+  recorded offset, and verifies the model's quote byte-for-byte. Mismatch =
+  the model fabricated the audit without reading the inlined file.
+- SHA echo is kept as a secondary defense (still catches post-audit file
+  edits) but is no longer the primary anti-fabrication mechanism.
+- Replaces v0.3.1's mitigation (refuse oversized files) with the proper fix
+  the v0.3.1 changelog flagged as deferred.
+
+### Changed — state model unified
+- `forked` status removed from `VALID_STATUSES` (7 → 6 states). The
+  v0.2.0-v0.3.1 distinction between "expanded by orchestrator" and "forked by
+  agent" was illusory — `pick-next`, `synthesize_report`, and
+  `_apply_status_transition` treated them identically. The "who created
+  these children" lineage now lives entirely on each child's
+  `spawned_by_agent` field.
+- `cmd_apply_subtree_fork` marks parent `expanded` (not `forked`).
+- `load_state()` migrates pre-v0.4.0 trees: `forked → expanded`, and
+  strips three dead v0.2.0 fields (`agent_capable`, `subtree_origin`,
+  `max_repair_attempts`) that the v0.3.1 schema cleanup didn't remove
+  from in-flight trees.
+
+### Changed — same-session detection
+- `cmd_session_step` no longer walks `/proc/<pid>/status` PPid chains
+  (Linux-only, brittle under Claude Code IDE restart). It now keys off
+  `$RESEARCH_TREE_SESSION_ID` env var, which the autopilot entrypoint sets
+  once per Claude Code session via `uuidgen`. Same env var across `/loop`
+  ticks → same session. Fresh env var → counter resets cleanly.
+- `session_step.json` schema field `ancestor_pids` → `session_id`. Old
+  files migrate by being treated as "different session" on first read.
+- 30 lines of /proc-parsing code (`get_ancestor_pids`) deleted.
+
+### Fixed — report layer (codex review round 2 P2-2 follow-through)
+- `synthesize_report.py` now counts `abandoned` nodes in the alive bucket
+  (they're not deliverables but they need to appear in the report so the
+  reviewer knows what's parked). Previously they vanished entirely.
+- ASCII tree marker map includes `abandoned: ⏸`.
+
+### Refactored
+- `cmd_add` now routes the pending→expanded transition through
+  `_apply_status_transition`, completing v0.3.1's "all status changes go
+  through one function" cleanup (the last direct write site).
+
+### Tests
+- New: `forked → expanded` migration + dead-field cleanup test
+  (`test_tree_state.sh`)
+- New: `session_id`-based session isolation test
+- New: `apply-subtree-fork` budget enforcement test
+- New: challenge-fragment PASS test (full pipeline with valid quotes)
+- New: challenge-fragment FAIL test (model fabricates wrong quote)
+- New: `AUDIT_CHALLENGES.json` missing FAIL test
+- All 6 suites pass after fixture updates.
+
+### Skill updates (research-tree)
+- `/home/chenliying/.claude/skills/research-tree/SKILL.md` updated to:
+  - Reflect new `cmd_complete` interface (drops `--validator-report`,
+    accepts `--audit-nonce-file` + `--require-codex-audit`)
+  - Document `EXECUTOR.json.pid_starttime` field (Linux `/proc/<pid>/stat`
+    field 22) for v0.3.1 PID-reuse detection
+  - Export `RESEARCH_TREE_SESSION_ID` at autopilot entry if unset
+  - Mark parent as `expanded` (not `forked`) after `apply-subtree-fork`
+  - Document challenge-fragment as the real anti-fabrication mechanism
+
+### Independent validation
+- A codex blind audit was run on this v0.4.0 changeset before commit
+  (the second such audit on the project, after the v0.3.1 audit that
+  caught 2 P0 trust-kernel bypasses Claude missed). See
+  `memory/decisions.md` v0.4.0 entry for the "Claude-writes + codex-audits"
+  practice now standard for tool changes.
+
 ## [0.3.1] — 2026-05-25
 
 Trust-kernel hardening + race condition fixes from a Linus-style code review

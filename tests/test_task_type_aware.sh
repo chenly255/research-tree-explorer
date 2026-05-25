@@ -109,22 +109,36 @@ if python3 "$TS" deps "$ID_DEP" > /dev/null 2>&1; then
 fi
 echo "  deps exits non-zero for unmet"
 
-echo "=== test 12: set task_type validates enum ==="
+echo "=== test 12: v0.4.0 — task_type is set-once at add time, not via set ==="
+# task_type is trust-relevant (validation schema choice); v0.4.0 made it
+# write-once-at-add to close a downgrade attack (set task_type=analysis).
 ID_X=$(python3 "$TS" add root experiment "set test" --task-type training)
-if python3 "$TS" set "$ID_X" task_type=bogus 2>/dev/null; then
-    echo "FAIL: set task_type=bogus should be rejected"
+if python3 "$TS" set "$ID_X" task_type=audit 2>/dev/null; then
+    echo "FAIL: set task_type should be refused in v0.4.0 (trust-kernel field)"
     exit 1
 fi
-python3 "$TS" set "$ID_X" task_type=audit
+# Invalid task_type at add must also be rejected
+if python3 "$TS" add root experiment "bogus" --task-type bogus 2>/dev/null; then
+    echo "FAIL: add --task-type bogus should be rejected"
+    exit 1
+fi
 TT=$(python3 "$TS" get "$ID_X" | python3 -c "import json,sys; print(json.load(sys.stdin)['task_type'])")
-test "$TT" = "audit"
-echo "  set task_type=<valid> works, set task_type=<bogus> rejected"
+test "$TT" = "training"
+echo "  task_type set-once at add, refused via set (v0.4.0 trust kernel)"
 
-echo "=== test 13: set depends_on parses comma-separated list ==="
-python3 "$TS" set "$ID_X" depends_on=root,$ID_DEP
-DEPS=$(python3 "$TS" get "$ID_X" | python3 -c "import json,sys; print(','.join(json.load(sys.stdin)['depends_on']))")
+echo "=== test 13: v0.4.0 — depends_on is set-once at add time (sibling-DoS guard) ==="
+# pre-v0.4: set depends_on=root,X was allowed. v0.4.0 removed it from
+# SET_ALLOWED_KEYS because an agent could `set sibling depends_on=missing`
+# to permanently block competitors from pick-next.
+if python3 "$TS" set "$ID_X" depends_on=root,$ID_DEP 2>/dev/null; then
+    echo "FAIL: set depends_on must be refused in v0.4.0 (sibling-DoS guard)"
+    exit 1
+fi
+# But it works at add time — that's the legitimate write site:
+ID_DEPNEW=$(python3 "$TS" add root experiment "deps test" --task-type training --depends-on "root,$ID_DEP")
+DEPS=$(python3 "$TS" get "$ID_DEPNEW" | python3 -c "import json,sys; print(','.join(json.load(sys.stdin)['depends_on']))")
 test "$DEPS" = "root,$ID_DEP"
-echo "  set depends_on (comma list) works"
+echo "  add --depends-on works; set depends_on refused"
 
 echo ""
 echo "=== validator: task-type-aware checks ==="

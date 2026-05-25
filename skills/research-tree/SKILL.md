@@ -294,17 +294,26 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
         nohup bash train.sh > executor.log 2>&1 &
         BGPID=$!
         ```
-     3. Write `.research-tree/branches/<node_id>/EXECUTOR.json` IMMEDIATELY:
-        ```json
+     3. Write `.research-tree/branches/<node_id>/EXECUTOR.json` IMMEDIATELY. v0.4.0
+        added `pid_starttime` so `stale_running_handler.py` can distinguish PID
+        reuse from a still-live process. On Linux, read field 22 of
+        `/proc/$BGPID/stat`:
+        ```bash
+        STARTTIME=$(awk '{print $22}' /proc/$BGPID/stat 2>/dev/null || echo null)
+        cat > EXECUTOR.json <<JSON
         {
-          \"pid\": <BGPID>,
-          \"started_at\": \"<iso8601>\",
-          \"command\": \"bash train.sh\",
-          \"log_file\": \".research-tree/branches/<node_id>/executor.log\",
-          \"expected_outputs\": [\"RESULT.md\", \"DEAD.md\"],
-          \"timeout_hours\": <reasonable_budget>
+          "pid": $BGPID,
+          "pid_starttime": $STARTTIME,
+          "started_at": "$(date -Iseconds)",
+          "command": "bash train.sh",
+          "log_file": ".research-tree/branches/<node_id>/executor.log",
+          "expected_outputs": ["RESULT.md", "DEAD.md"],
+          "timeout_hours": <reasonable_budget>
         }
+        JSON
         ```
+        On non-Linux (macOS), set `pid_starttime` to `null` — the handler falls
+        back to plain `kill(pid, 0)` and a same-PID liveness signal.
      4. **Return to the orchestrator NOW.** Do not wait for the background process. Your only job at this point is to confirm the launch succeeded (PID exists, log file is being written to). The orchestrator will poll for completion in later autopilot steps via `stale_running_handler.py`.
 
      **Why background**: the user keeps Claude Code sessions open for hours, then closes the IDE. A foreground subagent dies with the session; a nohup-detached process survives, so the training continues across session restarts. When the session reopens, `stale_running_handler.py` detects the completed process via PID check + RESULT.md presence and routes it through the validation chain.
@@ -448,7 +457,7 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
        ```bash
        python3 "$TREE_STATE" --project-root "$(pwd)" apply-subtree-fork <node_id>
        ```
-       The command parses `SUBTREE_FORK.md`, creates the candidate children, marks parent status=`forked`. Done — skip to step 7. **Do not also try to validate RESULT.md if both exist — fork takes precedence (a forking branch hasn't finished its own work).**
+       The command parses `SUBTREE_FORK.md`, creates the candidate children, marks parent status=`expanded` (v0.4.0 — was `forked` in v0.2-v0.3.1; the agent-self-fork lineage now lives on each child's `spawned_by_agent` field, no separate parent status). Done — skip to step 7. **Do not also try to validate RESULT.md if both exist — fork takes precedence (a forking branch hasn't finished its own work).**
      - **`SUBTREE_PIVOT.md` exists** (v0.2.0 — agent discovered the whole hypothesis is wrong; not fork but redirect): die the node + raise human-gate so Lily can decide whether to follow the pivot suggestion.
        ```bash
        python3 "$TREE_STATE" die <node_id> --reason "agent_pivot: $(grep -m1 reason .research-tree/branches/<node_id>/SUBTREE_PIVOT.md | sed 's/^reason:\s*//')" --evidence ".research-tree/branches/<node_id>/SUBTREE_PIVOT.md"
@@ -500,8 +509,8 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
             --out ".research-tree/branches/<node_id>/CODEX_AUDIT.json"
         AUDIT_EXIT=$?
         ```
-        If `AUDIT_EXIT == 0`, the CLI already wrote a validator-compliant CODEX_AUDIT.json with nonce echo + per-file SHA256s. Proceed to step 6d.
-     3. **FALLBACK PATH — `mcp__codex__codex`** (only if the CLI exit != 0 AND the tool is registered). Invoke in a FRESH thread (never codex-reply). The prompt MUST embed the nonce and demand that codex list every file it reads with its SHA256, so the validator can verify the audit was not pre-fabricated:
+        If `AUDIT_EXIT == 0`, the CLI already wrote both `CODEX_AUDIT.json` (model's response: nonce echo + per-file SHA256 + **challenge-fragment quotes** new in v0.4.0) AND `AUDIT_CHALLENGES.json` (orchestrator's random (file, offset, length) windows). Proceed to step 6d. The challenge-fragment scheme is v0.4.0's real anti-fabrication mechanism — the model must quote disk bytes at random offsets that the orchestrator picked before the call. Echoing the prompt is no longer sufficient.
+     3. **FALLBACK PATH — `mcp__codex__codex`** (only if the CLI exit != 0 AND the tool is registered). Invoke in a FRESH thread (never codex-reply). The prompt MUST embed the nonce, demand SHA256 echo, AND include challenge fragments (random byte offsets the model must quote verbatim). If the fallback path can't include challenges, write `AUDIT_CHALLENGES.json` first using `python3 -c "import random; ..."` and embed the challenge IDs/offsets in the codex prompt:
         ```
         You are an external adversarial auditor for a research branch. Your job is
         to read the artifacts on disk and decide whether the branch genuinely meets
@@ -557,9 +566,18 @@ Run one branch end-to-end in an **isolated subagent** so this main context isn't
        if grep -qE '^DONE_READY[=:]\s*true' ".research-tree/branches/<node_id>/RESULT.md"; then
          DONE_READY_FLAG="--done-ready"
        fi
-       python3 "$TREE_STATE" complete <node_id> --validator-report ".research-tree/branches/<node_id>/VALIDATION.json" --score "$METRIC" $DONE_READY_FLAG
+       python3 "$TREE_STATE" complete <node_id> --score "$METRIC" \
+           --audit-nonce-file ".research-tree/branches/<node_id>/AUDIT_NONCE" \
+           --require-codex-audit \
+           $DONE_READY_FLAG
        ```
-       `complete` re-reads the validator report, refuses to proceed if verdict ≠ PASS, and records the SHA256 of the report as completion_proof on the node. This means even if a subagent later swaps the validator report on disk, the proof becomes verifiably stale.
+       v0.3.1+: `complete` no longer accepts an external validator-report
+       path (that was a trust-kernel bypass). It re-runs `charter_validator`
+       as a subprocess on `branch_dir`, passing the nonce file so codex audit
+       + SHA cross-check + challenge-fragment cross-check all enforce. Trusted
+       source is fresh validator stdout, not anything the agent wrote. The
+       SHA256 of the validator's report (written to `branch_dir/VALIDATION.json`
+       by `complete`) is recorded as `completion_proof` on the node.
 
 7. After step 6, do NOT continue working on that branch in your own context. Do NOT re-spawn the subagent to "fix" validator failures. A FAIL or WARN is a dead branch — that's the design. The orchestrator moves on.
 
@@ -881,6 +899,15 @@ A single autopilot step does this:
      # v0.1.9 — pass RESEARCH_TREE_SILENT=1 when invoking from `autopilot --silent`
      # so the threshold default flips from 10 → 80 (≈ 40 hours unattended capacity).
      if [[ "$AUTOPILOT_MODE" == *silent* ]]; then export RESEARCH_TREE_SILENT=1; fi
+     # v0.4.0 — same-session detection is via $RESEARCH_TREE_SESSION_ID, not the
+     # old PPid chain. autopilot is supposed to set this once per Claude Code
+     # session; if it's missing, set it here so the first tick of a fresh
+     # session gets a stable id. Subsequent ticks (same session) inherit it via
+     # /loop's process env; ticks from a new Claude Code session (e.g. after
+     # IDE restart) get a fresh uuid and the counter resets cleanly.
+     if [ -z "${RESEARCH_TREE_SESSION_ID:-}" ]; then
+       export RESEARCH_TREE_SESSION_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex)")
+     fi
      python3 "$TREE_STATE" session-step increment > /tmp/rte_session_$$.json
      SESSION_EXIT=$?
      ```
