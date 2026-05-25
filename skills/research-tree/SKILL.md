@@ -65,8 +65,27 @@ The first token of `$ARGUMENTS` is the subcommand. Dispatch on it. If empty or `
 /research-tree status                       — ASCII tree + stats
 /research-tree synthesize                   — write FINAL_REPORT.md from current tree
 /research-tree autopilot [max_loops=20]     — full loop: pick → expand-or-execute → audit → repeat until stop criterion
-/research-tree resume                       — alias for autopilot, starts from current tree state
+/research-tree resume                       — clear human-gate + reset session step counter, then run one autopilot step
+/research-tree human-gate                   — admin: check/set/clear the AWAITING_HUMAN.md fast-exit sentinel
 ```
+
+**`/research-tree resume` semantics** (v0.1.8):
+When the user invokes `resume`, do this BEFORE dispatching to autopilot logic:
+```bash
+python3 "$TREE_STATE" human-gate clear --project-root "$(pwd)"
+python3 "$TREE_STATE" session-step reset --project-root "$(pwd)" --threshold 10
+```
+This is the only path that clears the gate. Resuming explicitly signals "human
+has handled whatever was awaiting them; reopen exploration". Then fall through
+to the normal autopilot step. If the user typed `/research-tree autopilot`
+instead, the gate is NOT cleared — autopilot will fast-exit at Step 0 if a gate
+is up. This distinction is intentional: `autopilot` is "do work if you can",
+`resume` is "explicitly continue after a human pause".
+
+**`/research-tree human-gate <action>`**: thin pass-through to
+`python3 "$TREE_STATE" human-gate <check|set|clear> [--reason ... | --all | --force]`.
+Useful for: manually raising the gate to pause a long-running /loop ("I'm going
+out, don't keep working") or inspecting why autopilot keeps fast-exiting.
 
 ### init
 
@@ -89,7 +108,7 @@ python3 "$TREE_STATE" init "$ROOT_IDEA" \
    ```
    Then tell the user: "I copied the default research charter to RESEARCH_CHARTER.md. **Read it and edit the venue/data/architecture/done-criteria fields to match your project before running autopilot.** Subagents will obey whatever's in there — bad charter = bad behavior."
 
-After init, print one paragraph to the user: "Tree initialized. Budgets: max depth 5, max 30 nodes total, max 48 GPU-hours. Charter at RESEARCH_CHARTER.md — **edit it now** if defaults don't fit (venue, downstream tasks, baselines). Two enforcement layers are active: (1) `charter_validator.py` checks physical files on every branch (test_split.json hash, ≥3 seed checkpoints, ablations, metrics.json fields), (2) every passing branch goes through a fresh codex thread for external audit. Fabricated RESULT.md without backing files = branch auto-marked dead. Run `/research-tree autopilot` to start, or `/loop 30m /research-tree autopilot --silent` for continuous unattended runs."
+After init, print one paragraph to the user: "Tree initialized. Budgets: max depth 5, max 30 nodes total, max 48 GPU-hours. Charter at RESEARCH_CHARTER.md — **edit it now** if defaults don't fit (venue, downstream tasks, baselines). Two enforcement layers are active: (1) `charter_validator.py` checks physical files on every branch (test_split.json hash, ≥3 seed checkpoints, ablations, metrics.json fields), (2) every passing branch goes through a fresh codex thread for external audit. Fabricated RESULT.md without backing files = branch auto-marked dead. **v0.1.8 — token-saving fast-exit**: when autopilot needs a human decision (session step cap, DONE, ROOT_FAILURE, etc.) it raises `.research-tree/AWAITING_HUMAN.md` and every subsequent /loop tick short-circuits at Step 0 with zero main-context tokens spent. To resume after handling, run `/research-tree resume`. Run `/research-tree autopilot` to start, or `/loop 30m /research-tree autopilot --silent` for continuous unattended runs."
 
 ### expand
 
@@ -485,18 +504,22 @@ Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights t
 
 **Modes**:
 - default: chatty single-step — every step returns a one-paragraph summary to the user
-- `autopilot --silent`: silent single-step — no per-step summary; only surfaces to the user on
-  three events: (a) DONE (charter done_criteria satisfied — autopilot STOPS and
-  hands off to human for paper-writing; nothing auto-invoked), (b) ROOT_FAILURE
-  (all root branches dead, pivot to /idea-pipeline), (c) STUCK (no new completed
-  node in 20 steps OR budget exhausted). For long runs (`/loop 30m autopilot --silent`)
-  the user only sees these key milestones.
+- `autopilot --silent`: silent single-step — no per-step summary. Surfaces ONLY
+  on key events:
+  (a) DONE (charter done_criteria satisfied — autopilot STOPS and hands off to
+      human for paper-writing; nothing auto-invoked),
+  (b) ROOT_FAILURE (all root branches dead, pivot to /idea-pipeline),
+  (c) STUCK / session-cap (no new completed node in 10 steps OR budget exhausted).
+  **v0.1.8: each of these events ALSO raises the human-gate sentinel** — so
+  subsequent /loop ticks while the user hasn't responded cost ZERO main-context
+  tokens (Step 0 short-circuits before any orchestration runs). For long runs
+  (`/loop 30m autopilot --silent`) the user sees the milestone exactly once.
 - `autopilot --continuous [--silent]` (v0.1.5): chained — keep doing steps as long
   as there is non-blocking work (pending leaves OR ready_for_validation nodes
   from finished background processes). Stop when:
   - all live nodes are `running` (waiting on background nohup) → can't do anything until they finish
   - DONE / ROOT_FAILURE detected → terminal
-  - session step counter hits threshold (default 20) → ask user to restart session for clean context
+  - session step counter hits threshold (default 10, lowered from 20 in v0.1.8) → raise human-gate, ask user to restart session for clean context
   - budget exhausted
   - same step counter ceiling acts as the STUCK guard
   Use `--continuous` when you want autopilot to chew through quick chained work
@@ -508,6 +531,32 @@ Read the resulting `.research-tree/FINAL_REPORT.md` and present its highlights t
 A single autopilot step does this:
 
 ```
+0. **Human-gate fast-exit** (v0.1.8 — the most important token-saving change).
+   Run this BEFORE anything else, including the stale-running sweep. The point
+   is to make `/loop 30m autopilot --silent` cost ~zero main-context tokens
+   per tick while the tree is waiting on a human decision.
+   ```bash
+   python3 "$TREE_STATE" human-gate check --project-root "$(pwd)" > /tmp/rte_gate_$$.json
+   GATE_EXIT=$?
+   ```
+   If `GATE_EXIT == 2`, the gate is up (one of: `.research-tree/AWAITING_HUMAN.md`,
+   `DONE.md`, or `ROOT_FAILURE.md`). A previous autopilot step already surfaced
+   the relevant info to the user. Stop NOW without running steps 1-11.
+   - **If `--silent` is in `$ARGUMENTS`** (or `SILENT=1` in env): print NOTHING.
+     Just exit. The Claude Code turn that wrapped this skill invocation
+     surfaces zero text to the user; main context stays untouched.
+   - **Otherwise**: print exactly ONE LINE — no markdown headers, no
+     paragraph, no tree dump:
+     ```
+     [awaiting human — see .research-tree/AWAITING_HUMAN.md; run /research-tree resume to clear]
+     ```
+     Then exit. Even in default (chatty) mode, do not elaborate. The user
+     already saw the original reason when the gate was first raised, and any
+     reminder adds context-window cost on every loop tick.
+   ```bash
+   rm -f /tmp/rte_gate_$$.json
+   ```
+
 1. Read progress: tail -1 .research-tree/progress.log (so you know what last step did)
 
 1.5. **Stale-running sweep** (v0.1.4 — handles cross-session-restart recovery):
@@ -531,15 +580,22 @@ A single autopilot step does this:
          # process still running, leave alone; pick-next won't pick it.
          log "node <id> still running pid=<pid> since <started_at>"
 
-2. Check for previously-detected terminal states:
+2. Check for previously-detected terminal states (FIRST TIME ONLY — repeats
+   are caught by Step 0's human-gate fast-exit so we don't re-surface them
+   every /loop tick):
      if .research-tree/ROOT_FAILURE.md exists:
-       Tell the user (always, even in silent): every approach under root is dead.
-       Show ROOT_FAILURE.md. Recommend pivot. STOP.
+       Tell the user: every approach under root is dead. Show ROOT_FAILURE.md.
+       Recommend pivot. Then raise the human-gate so subsequent /loop ticks
+       cost zero tokens:
+         python3 "$TREE_STATE" human-gate set --reason "ROOT_FAILURE: all approaches under root died — pivot via /idea-pipeline"
+       STOP.
      if .research-tree/DONE.md exists:
-       Tell the user (always, even in silent): done_criteria satisfied, autopilot
-       has stopped, branch passed programmatic validator AND external codex audit.
-       Show DONE.md (which contains the human-review checklist). Do NOT auto-invoke
-       any writing tool. STOP and wait for the human.
+       Tell the user: done_criteria satisfied, autopilot has stopped, branch
+       passed programmatic validator AND external codex audit. Show DONE.md
+       (which contains the human-review checklist). Do NOT auto-invoke any
+       writing tool. Then raise the human-gate:
+         python3 "$TREE_STATE" human-gate set --reason "DONE: charter done_criteria satisfied — human review then write paper"
+       STOP and wait for the human.
 
 3. Check budget:
      python3 "$TREE_STATE" budget-check
@@ -641,20 +697,33 @@ A single autopilot step does this:
    - **default mode**: report ONE PARAGRAPH to the user: what you did this step,
      what the tree looks like now (`python3 "$TREE_STATE" tree | head -20`), what
      `/research-tree autopilot` will do next time.
-   - **--silent mode**: do NOT report per-step. Just write to progress.log and stop.
-     Surface ONLY if: DONE.md was written this step, ROOT_FAILURE.md was written,
-     budget exhausted, OR no new completed node in 20 consecutive steps (STUCK).
+   - **--silent mode**: do NOT report per-step. Just write to progress.log and
+     exit. Surface ONLY if: DONE.md was written this step, ROOT_FAILURE.md was
+     written, budget exhausted, OR no new completed node in 10 consecutive
+     steps (STUCK). Each of those events ALSO raises the human-gate (Step 0),
+     so the message is delivered exactly once and subsequent /loop ticks are
+     free.
 
-11.5. **Session counter check** (v0.1.5 — context safety):
+11.5. **Session counter check** (v0.1.5; v0.1.8 raises human-gate automatically):
      ```bash
-     python3 "$TREE_STATE" session-step increment --threshold 20 > /tmp/rte_session_$$.json
+     python3 "$TREE_STATE" session-step increment --threshold 10 > /tmp/rte_session_$$.json
      SESSION_EXIT=$?
      ```
      If `SESSION_EXIT != 0` (i.e., `should_pause: true`), the session has accumulated
-     enough steps that the main Claude Code context is getting heavy. Stop and tell
-     the user verbatim (always, even in --silent mode):
+     enough steps that the main Claude Code context is getting heavy. **v0.1.8: the
+     session-step command itself raises the human-gate sentinel on first threshold
+     hit** — so subsequent /loop ticks short-circuit at Step 0 (zero tokens). Here at
+     Step 11.5 the autopilot only needs to surface the message ONCE on the
+     triggering tick:
+     - default mode: print the verbatim block below.
+     - `--silent` mode: print nothing (just exit). The gate is up; the user will
+       see the awaiting-human state next time they look at the project, and
+       can opt to inspect `.research-tree/AWAITING_HUMAN.md` then. This is the
+       v0.1.8 contract: silent runs cost zero main-context tokens while paused.
+
+     Default-mode message:
      ```
-     Session context approaching capacity (20+ autopilot steps in this session).
+     Session context approaching capacity (10+ autopilot steps in this session).
      Please restart Claude Code to clear context, then run /research-tree resume
      to continue. State is durable in .research-tree/tree.json — no progress lost.
      ```

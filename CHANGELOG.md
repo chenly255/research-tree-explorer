@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.8] — 2026-05-25
+
+Token-saving rework triggered by the sc-bias session-cap failure mode: every
+`/loop 30m autopilot --silent` tick was burning ~100-200 main-context tokens
+to re-print the "Session approaching capacity" warning, even when the tree
+was idle waiting for a human decision. Over a multi-hour run this compounded
+into context-window pressure on the user's main session — exactly what
+`--silent` was supposed to prevent. v0.1.8 adds a single sentinel file that
+short-circuits autopilot at Step 0, making idle ticks cost ~zero tokens.
+
+### Added
+- `.research-tree/AWAITING_HUMAN.md` sentinel file (new convention).
+  When present, autopilot's new Step 0 fast-exits without running any of the
+  expensive orchestration (stale sweep, pick-next, dispatch, audit, reflect,
+  synthesize). In `--silent` mode this prints absolutely nothing to the main
+  context; in default mode it prints exactly one line.
+- `python3 tree_state.py human-gate <check|set|clear>` subcommand. `check`
+  exits 2 when ANY of `AWAITING_HUMAN.md`, `DONE.md`, or `ROOT_FAILURE.md`
+  exists (autopilot Step 0 uses this as one short-circuit signal instead of
+  three separate file checks). `set --reason "..."` is idempotent by default
+  (won't churn the file on every retry); use `--force` to overwrite.
+  `clear` removes the gate; `clear --all` also removes terminal sentinels.
+- `/research-tree resume` (subcommand semantics, was previously just an
+  autopilot alias): clears the human-gate AND resets the session step
+  counter before dispatching one autopilot step. This is the only path
+  that clears the gate — running `/research-tree autopilot` while the gate
+  is up will just fast-exit again, by design.
+- `/research-tree human-gate <action>` admin pass-through, useful when the
+  user wants to manually pause a /loop ("I'm out, don't keep working")
+  without having to know the underlying script path.
+
+### Changed
+- `DEFAULT_SESSION_STEP_THRESHOLD` lowered from 20 → 10. Empirically 20 was
+  too generous for context-heavy bioinformatics projects (CLAUDE.md +
+  per-phase research briefs already consume a meaningful slice of the
+  window before autopilot even runs). 10 leaves room for the per-step
+  paragraph summary to land cleanly when /loop ticks back in.
+- `cmd_session_step` now auto-raises the human-gate sentinel on the first
+  `increment` call that crosses the threshold. Subsequent calls are
+  idempotent (the original reason wins). This removes the Step 11.5
+  responsibility of remembering which side of the threshold we're on.
+- `--silent` mode at Step 11.5 no longer prints the verbatim "Session
+  approaching capacity..." block — the gate is up, the user will see it
+  in `.research-tree/AWAITING_HUMAN.md` when they're ready.
+
+### Migration
+- No tree.json schema change. Existing trees pick up the new fast-exit
+  behavior on the next autopilot invocation. If your live `/loop` is
+  re-printing a stuck-state message every tick, just let the next /loop
+  tick run — Step 11.5 will raise the gate, and subsequent ticks will be
+  silent. To clear immediately, `python3 tree_state.py human-gate clear`.
+
 ## [0.1.7] — 2026-05-23
 
 Two upgrades that close the autopilot's biggest remaining unattended-run

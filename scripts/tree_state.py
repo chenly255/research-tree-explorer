@@ -47,6 +47,14 @@ STATE_FILE_NAME = "tree.json"
 LOCK_FILE_NAME = "tree.lock"
 SCHEMA_VERSION = "0.2"
 
+# v0.1.8 — human-gate fast-exit sentinel. When this file exists in the
+# state directory, autopilot's Step 0 short-circuits without dispatching
+# any subagent — saves orchestrator tokens on every /loop tick when the
+# tree is waiting for a human decision (context cap, DONE, ROOT_FAILURE,
+# framing decision, etc.). Cleared by `/research-tree resume` or by
+# `human-gate clear`.
+HUMAN_GATE_FILE_NAME = "AWAITING_HUMAN.md"
+
 VALID_STATUSES = {"pending", "expanded", "running", "completed", "dead"}
 
 # v0.1.6 — task_type: each branch can declare what KIND of work it does, so
@@ -78,7 +86,12 @@ SET_ALLOWED_KEYS = {
 # Session step counter — autopilot reports `should_pause: true` when this many
 # steps have accumulated within a single Claude Code session, so the user can
 # restart for a clean context. Default tuned to ~30-40% of typical context window.
-DEFAULT_SESSION_STEP_THRESHOLD = 20
+# v0.1.8 — lowered from 20 to 10. Empirically 20 was too generous: by step
+# 15-20 the main Claude Code context was already near its working ceiling,
+# and the per-step orchestration paragraph (even in --silent mode, until
+# v0.1.8's fast-exit) compounded the drift. 10 keeps the main context fresh
+# enough to write the per-step summary that lands when /loop ticks back in.
+DEFAULT_SESSION_STEP_THRESHOLD = 10
 
 
 def state_path(root: Path) -> Path:
@@ -695,6 +708,36 @@ def get_ancestor_pids() -> list[int]:
     return pids
 
 
+def _gate_path(root: Path) -> Path:
+    """Resolve absolute path to the human-gate sentinel file."""
+    return root / STATE_DIR_NAME / HUMAN_GATE_FILE_NAME
+
+
+def _write_human_gate(root: Path, reason: str, *, overwrite: bool = False) -> bool:
+    """Write the human-gate sentinel. Returns True if newly written, False if already present.
+
+    Default behavior is idempotent: if the gate is already up, leave it alone (the
+    earlier reason wins — don't churn the file every loop tick). Pass overwrite=True
+    only when callers explicitly want to bump the reason (e.g. a STUCK that turned
+    into a DONE).
+    """
+    gate = _gate_path(root)
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    if gate.exists() and not overwrite:
+        return False
+    body = (
+        f"# AWAITING HUMAN — autopilot paused\n\n"
+        f"**Written:** {now_iso()}\n"
+        f"**Reason:** {reason}\n\n"
+        f"Autopilot will fast-exit (no main-context tokens spent) on every "
+        f"`/loop` tick while this file exists. To resume, run:\n\n"
+        f"    /research-tree resume\n\n"
+        f"That clears this file and resets the session step counter.\n"
+    )
+    gate.write_text(body)
+    return True
+
+
 def cmd_session_step(args) -> None:
     """Track how many autopilot steps have run within the current Claude Code
     session. Detects 'same session' by ancestor-PID-chain intersection (robust
@@ -757,6 +800,21 @@ def cmd_session_step(args) -> None:
 
     threshold = args.threshold
     should_pause = count >= threshold
+
+    # v0.1.8 — when the threshold is first crossed during an `increment`, also
+    # raise the human-gate sentinel. Idempotent: subsequent ticks that re-hit
+    # the threshold won't re-write the file (the original reason wins). Step 0
+    # of autopilot will then fast-exit on every later /loop tick — zero main
+    # context tokens spent until the user runs `/research-tree resume`.
+    gate_raised = False
+    if should_pause and args.action == "increment":
+        gate_raised = _write_human_gate(
+            root,
+            f"session context cap ({count} autopilot steps in this session, "
+            f"threshold={threshold}). Restart Claude Code for a clean main "
+            f"context, then run `/research-tree resume`.",
+        )
+
     out = {
         "ancestor_pids_sampled": current_ancestors,
         "same_session_as_last_call": same_session,
@@ -764,9 +822,74 @@ def cmd_session_step(args) -> None:
         "threshold": threshold,
         "should_pause": should_pause,
         "action": action_taken,
+        "human_gate_raised_this_call": gate_raised,
     }
     print(json.dumps(out, indent=2))
     return 1 if should_pause else 0
+
+
+def cmd_human_gate(args) -> int:
+    """v0.1.8 — manage the AWAITING_HUMAN.md fast-exit sentinel.
+
+    Subactions:
+      check  — exit 2 (and print JSON) if the gate is up. Used by autopilot
+               Step 0 to short-circuit before any expensive work.
+      set    — write the gate with --reason. Idempotent; --force to overwrite.
+      clear  — delete the gate. Used by `/research-tree resume` to reopen.
+
+    `check` ALSO trips on terminal sentinels (DONE.md, ROOT_FAILURE.md), so
+    Step 0 only needs one call instead of three.
+    """
+    root = Path(args.project_root).resolve()
+    state_dir = root / STATE_DIR_NAME
+    gate = state_dir / HUMAN_GATE_FILE_NAME
+    done = state_dir / "DONE.md"
+    root_fail = state_dir / "ROOT_FAILURE.md"
+
+    if args.action == "check":
+        triggered = []
+        if gate.exists():
+            triggered.append({"file": HUMAN_GATE_FILE_NAME, "kind": "awaiting_human"})
+        if done.exists():
+            triggered.append({"file": "DONE.md", "kind": "done"})
+        if root_fail.exists():
+            triggered.append({"file": "ROOT_FAILURE.md", "kind": "root_failure"})
+        out = {
+            "awaiting": bool(triggered),
+            "triggered": triggered,
+            "gate_path": str(gate.relative_to(root)) if gate.is_absolute() else str(gate),
+        }
+        print(json.dumps(out, indent=2))
+        return 2 if triggered else 0
+
+    if args.action == "set":
+        if not args.reason:
+            sys.exit("ERROR: --reason required for `human-gate set`")
+        wrote = _write_human_gate(root, args.reason, overwrite=args.force)
+        print(json.dumps({"action": "set", "wrote_new_file": wrote, "force": args.force}))
+        return 0
+
+    if args.action == "clear":
+        existed = gate.exists()
+        if existed:
+            gate.unlink()
+        # Also clear DONE.md / ROOT_FAILURE.md ONLY if --all was passed; those
+        # are terminal sentinels the user usually wants to inspect before
+        # discarding, so default `clear` leaves them alone.
+        cleared_extras = []
+        if args.all:
+            for f in (done, root_fail):
+                if f.exists():
+                    f.unlink()
+                    cleared_extras.append(f.name)
+        print(json.dumps({
+            "action": "clear",
+            "removed_gate": existed,
+            "removed_extras": cleared_extras,
+        }))
+        return 0
+
+    sys.exit(f"ERROR: unknown action {args.action!r}")
 
 
 def cmd_budget_check(args) -> None:
@@ -919,6 +1042,31 @@ def main() -> None:
         help=f"steps in a session before should_pause=true (default {DEFAULT_SESSION_STEP_THRESHOLD})",
     )
     p_session.set_defaults(func=cmd_session_step)
+
+    # v0.1.8 — human-gate fast-exit sentinel
+    p_gate = sub.add_parser(
+        "human-gate",
+        help="manage AWAITING_HUMAN.md fast-exit sentinel (v0.1.8); "
+             "`check` exits 2 if the gate is up so autopilot can short-circuit "
+             "without spending main-context tokens",
+    )
+    p_gate.add_argument(
+        "action", choices=("check", "set", "clear"),
+        help="check = exit 2 if gate up; set = write with --reason; clear = remove",
+    )
+    p_gate.add_argument(
+        "--reason", default=None,
+        help="(set) human-readable reason the gate is being raised",
+    )
+    p_gate.add_argument(
+        "--force", action="store_true",
+        help="(set) overwrite an existing gate file (default: idempotent)",
+    )
+    p_gate.add_argument(
+        "--all", action="store_true",
+        help="(clear) also remove DONE.md and ROOT_FAILURE.md (default: leave them)",
+    )
+    p_gate.set_defaults(func=cmd_human_gate)
 
     args = p.parse_args()
     rc = args.func(args)
