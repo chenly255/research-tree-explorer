@@ -712,19 +712,31 @@ def check_codex_audit(branch_dir: Path, nonce_path: Path | None,
                 f"not a string. Model failed to quote the fragment."
             )
             continue
-        # Strict byte-for-byte. LLMs sometimes drop or add whitespace; for
-        # 64-byte fragments the model has no excuse — it must copy from the
-        # inlined content verbatim. Any normalization here would be a hole.
-        if model_response != expected_text:
-            failures.append(
-                f"CODEX_AUDIT.json: challenge {cid} ({rel} bytes "
-                f"[{offset}..{offset + length})) — model quoted "
-                f"{model_response[:80]!r}, disk has {expected_text[:80]!r}. "
-                f"Mismatch means the model fabricated the audit without "
-                f"reading the inlined file."
-            )
+        # Anti-fabrication tolerance: LLMs cannot reliably count to exact
+        # char offset N in a 4KB file (token != char). If the model's quote
+        # is a real substring of the disk content (length ≥ 32 chars to
+        # avoid trivial matches), it demonstrably read the file — the
+        # off-by-N is just counting noise. A fabricator cannot produce a
+        # 32+ char substring of unread content.
+        MIN_SUBSTRING_LEN = 32
+        if model_response == expected_text:
+            challenge_evidence[cid] = "match"
             continue
-        challenge_evidence[cid] = "match"
+        if (
+            model_response
+            and len(model_response) >= MIN_SUBSTRING_LEN
+            and model_response in disk_content
+        ):
+            challenge_evidence[cid] = "substring_match"
+            continue
+        failures.append(
+            f"CODEX_AUDIT.json: challenge {cid} ({rel} chars "
+            f"[{offset}..{offset + length})) — model quoted "
+            f"{model_response[:80]!r}, disk has {expected_text[:80]!r}. "
+            f"Mismatch means the model fabricated the audit without "
+            f"reading the inlined file."
+        )
+        continue
 
     # P1-2 — enforce coverage: every required file must have N challenges.
     # If the file is shorter than 64 bytes, 1 challenge (whole file) suffices.

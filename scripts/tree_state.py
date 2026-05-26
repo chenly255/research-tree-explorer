@@ -46,7 +46,17 @@ from typing import Any, Iterator
 STATE_DIR_NAME = ".research-tree"
 STATE_FILE_NAME = "tree.json"
 LOCK_FILE_NAME = "tree.lock"
-SCHEMA_VERSION = "0.2"
+SCHEMA_VERSION = "0.3"
+# v0.5.0 — first-principles refactor (Lily 2026-05-26):
+#   Every node action is now a gate: information-gain / cost > threshold.
+#   New per-node fields (all optional, backward-compat):
+#     budget_hours_min  — minimum-viable wall hours to answer the node's question
+#     budget_hours_full — full-scale wall hours (default = min if not split)
+#     info_value_score  — 1-5 subjective value (1=cosmetic, 5=headline-load-bearing)
+#     depends_on_soft   — recommended-order deps that DO NOT block pick-next
+#     parallel_group    — peer nodes that should run concurrently when ready
+#   pick-next now respects depends_on_soft (informational) + parallel_group
+#   (encourages batched concurrent dispatch).
 
 # v0.1.8 — human-gate fast-exit sentinel. When this file exists in the
 # state directory, autopilot's Step 0 short-circuits without dispatching
@@ -114,6 +124,15 @@ SET_ALLOWED_KEYS = {
     # for append-only post-mortem notes.
     "description",
     "direct_executable",  # set by expand-flow when proposer skipped
+    # v0.5.0 — cost/value/parallel hints. These are estimates the proposer
+    # writes once and the orchestrator may refine as work progresses; they
+    # influence pick-next ordering and the human-facing budget view but do
+    # NOT control validator pass/fail or completion proof.
+    "budget_hours_min",
+    "budget_hours_full",
+    "info_value_score",
+    "depends_on_soft",
+    "parallel_group",
 }
 
 # Session step counter — autopilot reports `should_pause: true` when this many
@@ -228,6 +247,19 @@ def _migrate_state(state: dict[str, Any]) -> bool:
             if dead_field in n:
                 n.pop(dead_field, None)
                 dirty = True
+        # v0.5.0 — backfill cost/value/parallel fields on pre-v0.5 nodes.
+        # None means "unknown" — gates won't fire on them, behavior is identical
+        # to v0.4.0 for legacy trees.
+        for new_field, default in (
+            ("budget_hours_min", None),
+            ("budget_hours_full", None),
+            ("info_value_score", None),
+            ("depends_on_soft", []),
+            ("parallel_group", None),
+        ):
+            if new_field not in n:
+                n[new_field] = default
+                dirty = True
 
     # P1-7 — recompute stats on every load. If the in-memory state already
     # matches, no dirty flag. If history drifted (counter bugs from older
@@ -248,6 +280,12 @@ def _migrate_state(state: dict[str, Any]) -> bool:
         dirty = True
     if stats.get("nodes_total") != len(nodes_list):
         stats["nodes_total"] = len(nodes_list)
+        dirty = True
+
+    # v0.5.0 — bump schema_version on disk once migration has applied.
+    # Idempotent: subsequent loads see version already current and don't churn.
+    if state.get("schema_version") != SCHEMA_VERSION:
+        state["schema_version"] = SCHEMA_VERSION
         dirty = True
 
     return dirty
@@ -308,10 +346,18 @@ def _build_new_node(
     depends_on: list[str],
     human_only: bool,
     spawned_by_agent: str | None = None,
+    budget_hours_min: float | None = None,
+    budget_hours_full: float | None = None,
+    info_value_score: int | None = None,
+    depends_on_soft: list[str] | None = None,
+    parallel_group: str | None = None,
 ) -> dict[str, Any]:
     """v0.3.1 — single source of truth for new-node schema. Both cmd_add and
     cmd_apply_subtree_fork call this so we don't have two parallel field
     constructors that drift apart when fields are added/removed.
+
+    v0.5.0 adds cost/value/parallel fields. All optional — when None, behavior
+    is identical to v0.4.0.
     """
     return {
         "id": new_id,
@@ -336,6 +382,12 @@ def _build_new_node(
         "last_failure_context": None,
         "spawned_by_agent": spawned_by_agent,
         "created_at": now_iso(),
+        # v0.5.0 — cost / value / parallel fields. None = unknown, no gate enforced.
+        "budget_hours_min": budget_hours_min,
+        "budget_hours_full": budget_hours_full,
+        "info_value_score": info_value_score,
+        "depends_on_soft": depends_on_soft or [],
+        "parallel_group": parallel_group,
     }
 
 
@@ -444,6 +496,19 @@ def cmd_add(args) -> None:
                 sys.exit(f"ERROR: depends_on references unknown node {dep_id!r}.")
         human_only = bool(getattr(args, "human_only", False))
 
+        # v0.5.0 — cost/value/parallel optional fields
+        depends_on_soft_raw = getattr(args, "depends_on_soft", None) or ""
+        depends_on_soft = [d.strip() for d in depends_on_soft_raw.split(",") if d.strip()]
+        for dep_id in depends_on_soft:
+            if dep_id not in state["nodes"]:
+                sys.exit(f"ERROR: depends_on_soft references unknown node {dep_id!r}.")
+        budget_min = getattr(args, "budget_hours_min", None)
+        budget_full = getattr(args, "budget_hours_full", None)
+        if budget_full is None and budget_min is not None:
+            budget_full = budget_min  # full defaults to min if not split
+        info_value = getattr(args, "info_value_score", None)
+        parallel_group = getattr(args, "parallel_group", None)
+
         parent_node = state["nodes"][parent_id]
         constraints = state["global_constraints"]
 
@@ -477,6 +542,11 @@ def cmd_add(args) -> None:
             depends_on=depends_on,
             human_only=human_only,
             spawned_by_agent=getattr(args, "spawned_by_agent", None),
+            budget_hours_min=budget_min,
+            budget_hours_full=budget_full,
+            info_value_score=info_value,
+            depends_on_soft=depends_on_soft,
+            parallel_group=parallel_group,
         )
         state["nodes"][new_id] = new_node
         parent_node["children"].append(new_id)
@@ -506,6 +576,23 @@ def parse_kv(items: list[str]) -> dict[str, Any]:
         # v0.1.6 — depends_on stores a list; accept comma-separated values from `set`
         if k == "depends_on":
             out[k] = [x.strip() for x in v.split(",") if x.strip()] if v else []
+            continue
+        # v0.5.0 — depends_on_soft same format as depends_on
+        if k == "depends_on_soft":
+            out[k] = [x.strip() for x in v.split(",") if x.strip()] if v else []
+            continue
+        # v0.5.0 — info_value_score must be int 1-5
+        if k == "info_value_score":
+            if v.lower() in ("null", "none", ""):
+                out[k] = None
+                continue
+            try:
+                iv = int(v)
+            except ValueError:
+                sys.exit(f"ERROR: info_value_score must be int 1-5, got {v!r}")
+            if iv < 1 or iv > 5:
+                sys.exit(f"ERROR: info_value_score must be 1-5, got {iv}")
+            out[k] = iv
             continue
         # v0.1.6 — task_type must be one of the valid enum values
         if k == "task_type":
@@ -1346,33 +1433,60 @@ def cmd_pick_next(args) -> None:
       1. Status == pending (never touched)
       2. v0.1.6 — skip nodes with `human_only=true` (autopilot must not touch them)
       3. v0.1.6 — skip nodes whose `depends_on` lists any non-completed node
-      4. Highest parent score (deepen winners)
-      5. Shallowest depth as tiebreak
+         (HARD deps. v0.5.0 — `depends_on_soft` is NOT enforced here, only logged
+         as recommended ordering; it never blocks pick-next.)
+      4. v0.5.0 — parallel_group bonus: if any peer with the same parallel_group
+         is currently `running`, prefer this candidate (encourages batched
+         concurrent dispatch instead of serializing the group).
+      5. v0.5.0 — info_value_score bonus: higher-value nodes win ties.
+      6. Highest parent score (deepen winners)
+      7. Shallowest depth as tiebreak
     """
     root = Path(args.project_root).resolve()
     state = load_state(root)
+
+    # Pre-compute the set of parallel_groups with at least one running peer.
+    # A pending node in one of these groups gets the "join your group" bonus.
+    running_groups = set()
+    for n in state["nodes"].values():
+        if n["status"] == "running":
+            pg = n.get("parallel_group")
+            if pg:
+                running_groups.add(pg)
+
     candidates = []
     for n in state["nodes"].values():
         if n["status"] != "pending":
             continue
-        # v0.1.6 — autopilot must not pick human-only nodes (paper framing
-        # decisions, venue choice, etc. belong to the user)
+        # v0.1.6 — autopilot must not pick human-only nodes
         if n.get("human_only", False):
             continue
-        # v0.1.6 — skip nodes blocked by unmet dependencies
+        # v0.1.6 — skip nodes blocked by unmet HARD deps. (Soft deps don't block.)
         ok, _ = _deps_satisfied(state, n)
         if not ok:
             continue
+
+        # v0.5.0 — parallel_group join bonus
+        group_bonus = 1.0 if n.get("parallel_group") in running_groups else 0.0
+        # v0.5.0 — info_value bonus (1-5 → 0.0-0.4 priority, modest weight)
+        iv = n.get("info_value_score") or 0
+        info_bonus = iv * 0.1
+
         parent_score = (
             state["nodes"][n["parent"]]["score"] if n["parent"] else 1.0
         )
         parent_score = parent_score if parent_score is not None else 0.5
-        candidates.append((parent_score, -n["depth"], n["id"]))
+
+        # Composite: group_bonus dominates (encourage parallel completion),
+        # then info_value, then parent_score, then shallow depth.
+        composite = (group_bonus, info_bonus, parent_score, -n["depth"])
+        candidates.append((composite, n["id"]))
+
     if not candidates:
         print("NONE")
         return
     candidates.sort(reverse=True)
-    print(candidates[0][2])
+    print(candidates[0][1])
 
 
 def cmd_deps(args) -> None:
@@ -1485,29 +1599,69 @@ def _gate_path(root: Path) -> Path:
     return root / STATE_DIR_NAME / HUMAN_GATE_FILE_NAME
 
 
-def _write_human_gate(root: Path, reason: str, *, overwrite: bool = False) -> bool:
+def _write_human_gate(root: Path, reason: str, *, overwrite: bool = False, auto_marker: str | None = None, snapshot: dict | None = None) -> bool:
     """Write the human-gate sentinel. Returns True if newly written, False if already present.
 
     Default behavior is idempotent: if the gate is already up, leave it alone (the
     earlier reason wins — don't churn the file every loop tick). Pass overwrite=True
     only when callers explicitly want to bump the reason (e.g. a STUCK that turned
     into a DONE).
+
+    v0.5.0 — `auto_marker` distinguishes orchestrator-raised gates (e.g.
+    ALL_RUNNING) from explicit user/human gates. Auto-raised gates can be
+    self-cleared by `auto-clear-if-stale` when the tree state changes. Human
+    gates require explicit `/research-tree resume`. `snapshot` (dict, e.g.
+    {"running_node_ids": ["1.2", "1.4.3"]}) is the state snapshot at raise
+    time; auto-clear compares against current state to decide if the gate
+    is stale.
     """
     gate = _gate_path(root)
     gate.parent.mkdir(parents=True, exist_ok=True)
     if gate.exists() and not overwrite:
         return False
-    body = (
-        f"# AWAITING HUMAN — autopilot paused\n\n"
-        f"**Written:** {now_iso()}\n"
-        f"**Reason:** {reason}\n\n"
-        f"Autopilot will fast-exit (no main-context tokens spent) on every "
-        f"`/loop` tick while this file exists. To resume, run:\n\n"
-        f"    /research-tree resume\n\n"
-        f"That clears this file and resets the session step counter.\n"
-    )
-    gate.write_text(body)
+    body_lines = [
+        f"# AWAITING HUMAN — autopilot paused",
+        "",
+        f"**Written:** {now_iso()}",
+        f"**Reason:** {reason}",
+    ]
+    if auto_marker:
+        body_lines.append(f"**Auto-marker:** {auto_marker}")
+    if snapshot:
+        body_lines.append(f"**Snapshot:** {json.dumps(snapshot, sort_keys=True)}")
+    body_lines.extend([
+        "",
+        "Autopilot will fast-exit (no main-context tokens spent) on every "
+        "`/loop` tick while this file exists. To resume, run:",
+        "",
+        "    /research-tree resume",
+        "",
+        "That clears this file and resets the session step counter.",
+        "",
+    ])
+    gate.write_text("\n".join(body_lines))
     return True
+
+
+def _read_gate_metadata(root: Path) -> dict | None:
+    """v0.5.0 — return {auto_marker, snapshot} dict if gate is up and parseable,
+    None otherwise. Used by `auto-clear-if-stale` to decide self-clear eligibility.
+    """
+    gate = _gate_path(root)
+    if not gate.exists():
+        return None
+    text = gate.read_text()
+    out = {"auto_marker": None, "snapshot": None}
+    for line in text.splitlines():
+        if line.startswith("**Auto-marker:**"):
+            out["auto_marker"] = line.split("**Auto-marker:**", 1)[1].strip()
+        elif line.startswith("**Snapshot:**"):
+            raw = line.split("**Snapshot:**", 1)[1].strip()
+            try:
+                out["snapshot"] = json.loads(raw)
+            except json.JSONDecodeError:
+                out["snapshot"] = None
+    return out
 
 
 def cmd_session_step(args) -> None:
@@ -1674,6 +1828,80 @@ def cmd_human_gate(args) -> int:
         }))
         return 0
 
+    if args.action == "auto-raise":
+        # v0.5.0 — orchestrator-raised gate when all alive nodes are blocked
+        # waiting on running background work. Idempotent: no-op if any gate
+        # already up. Snapshots the running set so `auto-clear-if-stale` can
+        # tell when the state changed.
+        if gate.exists() or done.exists() or root_fail.exists():
+            print(json.dumps({"action": "auto-raise", "raised": False, "reason": "gate already up"}))
+            return 0
+        state = load_state(root)
+        alive_nodes = [n for n in state["nodes"].values()
+                       if n["status"] in ("pending", "expanded", "running")]
+        running_nodes = [n for n in alive_nodes if n["status"] == "running"]
+        # Only auto-raise when there's nothing to do AND there's something running.
+        # If alive set is empty (all completed or all dead), don't auto-raise —
+        # that's a terminal state for synthesize to handle.
+        if not running_nodes:
+            print(json.dumps({"action": "auto-raise", "raised": False, "reason": "no running nodes — nothing to wait for"}))
+            return 0
+        # Mirror pick-next's pickable logic: a node is genuinely actionable
+        # only if status==pending AND deps satisfied AND not human_only AND
+        # not the root meta-node. (`expanded` nodes have already been
+        # branched; their children are what pick-next selects.)
+        actionable = []
+        for n in alive_nodes:
+            if n["status"] != "pending":
+                continue
+            if n.get("human_only", False):
+                continue
+            if n.get("kind") == "root":
+                continue
+            ok, _ = _deps_satisfied(state, n)
+            if not ok:
+                continue
+            actionable.append(n)
+        if actionable:
+            ids = [n["id"] for n in actionable[:5]]
+            print(json.dumps({"action": "auto-raise", "raised": False, "reason": f"actionable nodes exist: {ids}"}))
+            return 0
+        snapshot = {"running_node_ids": sorted(n["id"] for n in running_nodes)}
+        wrote = _write_human_gate(
+            root,
+            reason=f"ALL_RUNNING: {len(running_nodes)} background job(s) in flight, autopilot fast-exiting until state change",
+            auto_marker="ALL_RUNNING",
+            snapshot=snapshot,
+        )
+        print(json.dumps({"action": "auto-raise", "raised": wrote, "snapshot": snapshot}))
+        return 0
+
+    if args.action == "auto-clear-if-stale":
+        # v0.5.0 — auto-clear an ALL_RUNNING gate when the tree state has
+        # changed since the gate was raised (any node in the snapshot is no
+        # longer running OR a new running node appeared). Never touches human-
+        # raised gates (no auto_marker). Never touches DONE / ROOT_FAILURE.
+        meta = _read_gate_metadata(root)
+        if meta is None or meta.get("auto_marker") != "ALL_RUNNING":
+            print(json.dumps({"action": "auto-clear-if-stale", "cleared": False, "reason": "no ALL_RUNNING auto-gate"}))
+            return 0
+        snapshot = meta.get("snapshot") or {}
+        snapshot_running = set(snapshot.get("running_node_ids", []))
+        state = load_state(root)
+        current_running = {n["id"] for n in state["nodes"].values() if n["status"] == "running"}
+        if snapshot_running == current_running:
+            print(json.dumps({"action": "auto-clear-if-stale", "cleared": False, "reason": "running set unchanged", "running_now": sorted(current_running)}))
+            return 0
+        # State changed — clear the auto-gate so autopilot can pick up the new work.
+        gate.unlink()
+        print(json.dumps({
+            "action": "auto-clear-if-stale",
+            "cleared": True,
+            "running_at_raise": sorted(snapshot_running),
+            "running_now": sorted(current_running),
+        }))
+        return 0
+
     sys.exit(f"ERROR: unknown action {args.action!r}")
 
 
@@ -1757,6 +1985,27 @@ def main() -> None:
     p_add.add_argument(
         "--spawned-by-agent", default=None,
         help="node_id of the agent that decided to spawn this child (v0.2.0)",
+    )
+    # v0.5.0 — cost / value / parallel fields. All optional.
+    p_add.add_argument(
+        "--budget-hours-min", type=float, default=None,
+        help="estimated minimum-viable wall hours (PoC scope). v0.5.0",
+    )
+    p_add.add_argument(
+        "--budget-hours-full", type=float, default=None,
+        help="estimated full-scale wall hours. If unset, defaults to budget-hours-min. v0.5.0",
+    )
+    p_add.add_argument(
+        "--info-value-score", type=int, default=None, choices=[1, 2, 3, 4, 5],
+        help="subjective info value 1-5 (1=cosmetic, 5=headline-load-bearing). v0.5.0",
+    )
+    p_add.add_argument(
+        "--depends-on-soft", default=None,
+        help="comma-separated node_ids that are recommended-order but NOT blocking. v0.5.0",
+    )
+    p_add.add_argument(
+        "--parallel-group", default=None,
+        help="group tag — peers with same tag dispatched concurrently when ready. v0.5.0",
     )
     p_add.set_defaults(func=cmd_add)
 
@@ -1955,8 +2204,10 @@ def main() -> None:
              "without spending main-context tokens",
     )
     p_gate.add_argument(
-        "action", choices=("check", "set", "clear"),
-        help="check = exit 2 if gate up; set = write with --reason; clear = remove",
+        "action", choices=("check", "set", "clear", "auto-raise", "auto-clear-if-stale"),
+        help=("check = exit 2 if gate up; set = write with --reason; clear = remove; "
+              "auto-raise = orchestrator-raised ALL_RUNNING gate when nothing actionable (v0.5.0); "
+              "auto-clear-if-stale = clear ONLY if it's an ALL_RUNNING auto-gate AND state changed (v0.5.0)"),
     )
     p_gate.add_argument(
         "--reason", default=None,

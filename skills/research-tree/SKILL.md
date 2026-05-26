@@ -197,6 +197,21 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
           `pick-next` respects `depends_on`. This is the v0.1.7
           version of "stop forcing autopilot to attempt experiments
           on data that does not exist yet".
+   - **v0.5.0 — first-principles cost gate**: tell the proposer:
+     "Every node is a unit of (cost × information value). Before proposing a
+     candidate, estimate: (a) `budget_hours_min` — minimum-viable wall hours
+     that would let us answer the candidate's research question (PoC scope);
+     (b) `budget_hours_full` — full-scale wall hours for the complete version;
+     (c) `info_value_score` 1-5 — 1 cosmetic/supplementary, 3 informative,
+     5 paper-headline-load-bearing. **Hard rule**: if `budget_hours_full /
+     budget_hours_min > 3`, you MUST split the candidate into a PoC sibling
+     (budget_hours_min scope) and a full sibling (depends_on_placeholders =
+     [poc_placeholder]). The full version only runs after the PoC validates
+     direction. **Default to the smallest version that answers the question.**
+     Full-scale only justifies when PoC has already passed.
+     Also: if multiple candidates can genuinely run concurrently with no
+     resource conflict, set `parallel_group` to the same tag — pick-next
+     will prefer dispatching grouped peers together."
    - tell it: "Return ONLY a JSON object (not a bare array), schema:
      ```json
      {
@@ -207,17 +222,27 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
           "task_type": "training|audit|analysis|data-acquisition|framing-decision|mixed",
           "human_only": false,
           "depends_on_placeholders": [],
+          "depends_on_soft_placeholders": [],
+          "parallel_group": null,
+          "budget_hours_min": 2.0,
+          "budget_hours_full": 4.0,
+          "info_value_score": 3,
           "title": "<≤80 chars>",
           "description": "<2-4 sentences. For data-acquisition candidates: include source (CELLxGENE dataset UUID / GEO accession / figshare DOI) and expected n_cells.>"}
        ]
      }
      ```
-     The `placeholder_id` lets siblings declare dependencies on
-     each other before any real node IDs exist (see v0.1.7
-     auto-propose data-acquisition rule above). The orchestrator
-     maps placeholders → real IDs after each `add` call. If a
-     candidate has no dependencies, leave `depends_on_placeholders`
-     empty.
+     - `placeholder_id` lets siblings declare deps on each other before
+       any real node IDs exist; orchestrator resolves on add (v0.1.7).
+     - `depends_on_placeholders` = HARD deps (must complete before pickable).
+     - `depends_on_soft_placeholders` (v0.5.0) = recommended-order deps
+       (don't block pick-next; used for documentation + audit context).
+     - `parallel_group` (v0.5.0) = string tag; peers with same tag are
+       dispatched concurrently when ready. Leave null when N/A.
+     - `budget_hours_min` / `budget_hours_full` / `info_value_score` (v0.5.0):
+       mandatory cost-gate fields. See the "first-principles cost gate"
+       paragraph above. If you cannot estimate them honestly, use null and
+       explain in description — orchestrator will flag for human input.
 
      OR, when no branching is justified (depth ≥1 only):
      ```json
@@ -243,22 +268,31 @@ Generate 2-4 candidate child branches for a node. **This work goes into a subage
      ```bash
      # Pass 1 — add every candidate WITHOUT --depends-on. Capture the
      # real id printed by `add` and build a placeholder_id → real_id map.
+     # v0.5.0 — also thread cost/value/parallel fields through to `add`.
      declare -A PLACE2ID
      for c in candidates[]; do
        EXTRA=""
        [ -n "<task_type>" ] && EXTRA="$EXTRA --task-type <task_type>"
        [ "<human_only>" = "true" ] && EXTRA="$EXTRA --human-only"
+       [ -n "<budget_hours_min>" ] && EXTRA="$EXTRA --budget-hours-min <budget_hours_min>"
+       [ -n "<budget_hours_full>" ] && EXTRA="$EXTRA --budget-hours-full <budget_hours_full>"
+       [ -n "<info_value_score>" ] && EXTRA="$EXTRA --info-value-score <info_value_score>"
+       [ -n "<parallel_group>" ] && EXTRA="$EXTRA --parallel-group <parallel_group>"
        NEW_ID=$(python3 "$TREE_STATE" add <parent_node_id> <kind> "<title>" \
                   --description "<description>" $EXTRA)
        PLACE2ID["<placeholder_id>"]="$NEW_ID"
      done
 
-     # Pass 2 — for any candidate with non-empty depends_on_placeholders,
-     # translate each placeholder to its real id and patch the node via
-     # `set depends_on=<csv>` (parse_kv handles comma-separated lists):
+     # Pass 2 — for any candidate with non-empty depends_on_placeholders or
+     # depends_on_soft_placeholders, translate placeholders to real ids and
+     # patch the node via `set` (parse_kv handles comma-separated lists):
      for c in candidates[] where depends_on_placeholders != []; do
        DEPS_CSV=$(join , for p in depends_on_placeholders: PLACE2ID[$p])
        python3 "$TREE_STATE" set "${PLACE2ID[<placeholder_id>]}" depends_on="$DEPS_CSV"
+     done
+     for c in candidates[] where depends_on_soft_placeholders != []; do
+       SOFT_CSV=$(join , for p in depends_on_soft_placeholders: PLACE2ID[$p])
+       python3 "$TREE_STATE" set "${PLACE2ID[<placeholder_id>]}" depends_on_soft="$SOFT_CSV"
      done
      ```
      Pass-2 patching uses `set` because `add` validates `depends_on`
@@ -704,7 +738,15 @@ A single autopilot step does this:
    Run this BEFORE anything else, including the stale-running sweep. The point
    is to make `/loop 30m autopilot --silent` cost ~zero main-context tokens
    per tick while the tree is waiting on a human decision.
+
+   **v0.5.0 — auto-clear-then-check**: before reading the gate, give any
+   orchestrator-raised ALL_RUNNING gate a chance to self-clear. The gate
+   carries a snapshot of `running_node_ids` at raise time; if any of those
+   has transitioned out of `running` (completed / dead / abandoned), the
+   work environment has changed and the gate is stale. `auto-clear-if-stale`
+   is a no-op on human-raised gates (no auto_marker) and on DONE/ROOT_FAILURE.
    ```bash
+   python3 "$TREE_STATE" human-gate auto-clear-if-stale --project-root "$(pwd)" > /tmp/rte_autoclr_$$.json
    python3 "$TREE_STATE" human-gate check --project-root "$(pwd)" > /tmp/rte_gate_$$.json
    GATE_EXIT=$?
    ```
@@ -793,9 +835,24 @@ A single autopilot step does this:
 
 4. Pick the next leaf:
      next_id=$(python3 "$TREE_STATE" pick-next)
-   If next_id == "NONE" → run synthesize, then read the new FINAL_REPORT.md's
-   "Suggested next move" section and surface those options verbatim to the user
-   (deepen winner / resolve alive / write paper via ARIS, OR pivot if all root dead).
+   If next_id == "NONE":
+   - **v0.5.0 — try auto-raise first** before deciding what to surface:
+     ```bash
+     python3 "$TREE_STATE" human-gate auto-raise > /tmp/rte_autoraise_$$.json
+     ```
+     `auto-raise` writes an ALL_RUNNING gate **iff** there are running
+     background nodes AND no actionable pending work. On the next /loop
+     tick, Step 0's `auto-clear-if-stale` will unstick it the moment any
+     running node finishes. This collapses "tree waiting on nohup" from
+     "30 ticks burning a few KB each" to a single token-free fast-exit
+     until something changes.
+   - If `auto-raise` raised the gate (silent mode): exit silently. Default
+     mode: print one line `[ALL_RUNNING — N background job(s) in flight,
+     auto-gate raised; next tick self-clears on state change]`.
+   - If `auto-raise` DID NOT raise (no running jobs at all → terminal):
+     run synthesize, then read FINAL_REPORT.md's "Suggested next move"
+     section and surface those options to the user (deepen winner /
+     resolve alive / write paper via ARIS, OR pivot if all root dead).
    STOP.
 
 5. Get its state:
