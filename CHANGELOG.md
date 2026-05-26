@@ -2,6 +2,126 @@
 
 All notable changes to this project will be documented here.
 
+## [1.0.0] — 2026-05-26
+
+**Architecture rewrite.** Triggered by Lily directing "不要打补丁, 从架构层面优化"
+after watching the v0.5 patches accumulate. Six structural problems
+identified in `DESIGN-PRINCIPLES.md` (written earlier on 2026-05-26) are now
+addressed. No more "v0.5.1 / v0.5.2 / ..." patch trail — the next milestone
+is v1.1 with worker / event additions, not v0.5.x patches.
+
+### Lily's two surface pain points (root cause of this rewrite)
+
+1. **"无脑分叉"** — the v0.5 proposer subagent self-judged duplication
+   (`skip_expansion: true/false`) with no structural backing. Sibling
+   candidates frequently amounted to the same work re-skinned.
+2. **"什么时候应该跟其他节点合并"** — v0.5 had no merge concept at all.
+   prune / die / backtrack were the only sibling-handling primitives.
+
+### Six architectural changes
+
+1. **Graph, not tree.** Edges (`parent-of`, `hard-dep`, `soft-dep`,
+   `merges-into`, `derived-from`, `parallel-with`) are first-class objects
+   in `graph.json`. Nodes no longer carry `parent` / `children` /
+   `depends_on` / `depends_on_soft` / `parallel_group` fields. Relationship
+   queries (`graph.parent_of`, `graph.children_of`, `graph.depth_of`,
+   `graph.merge_sources_of`, …) compute from edges.
+
+2. **Status is three orthogonal axes.** `lifecycle ∈ {created, running,
+   done, failed}` + `is_branched: bool` + `is_abandoned: bool`. Every
+   v0.5 status (pending / expanded / running / completed / dead /
+   abandoned) maps to one combination. No more overloaded enum.
+
+3. **One Worker class per task_type.** `research_tree/workers/{training,
+   audit, analysis, data_acquisition, framing_decision}.py` each encode
+   their task type's artifact requirements + validation in a single class.
+   The 200-lines-per-task-type artifact blocks that lived in SKILL.md are
+   gone — SKILL.md went from 1042 lines to 250 lines (76 % reduction).
+   `WorkerRegistry` makes adding a 6th task type one file, not 4 file edits.
+
+4. **Structured branching decisions.** `branching_decider.py` exposes
+   two APIs:
+   - `decide_to_fork(parent)` — runs BEFORE the proposer is invoked.
+     Cost-value gate (low info_value + high cost → DIRECT_EXECUTE),
+     depth gate (root forces FORK, near-max-depth forces DIRECT_EXECUTE).
+   - `decide_to_accept_candidate(candidate, parent)` — runs PER candidate
+     the proposer returns. Hard-duplicate gate (cosine ≥ 0.85 →
+     MERGE_WITH), explicit-axis gate (same `"X vs Y"` axis as existing
+     sibling → REJECT), cross-tree dup gate. The proposer no longer
+     self-judges duplication.
+
+5. **First-class node merging.** `node_merger.py`:
+   - `detect_merge_opportunities(graph)` scans completed sibling pairs
+     for complementary axes (atlas / cell_type / fm / metric / disease)
+     via conservative regex whitelists. Returns MergeProposals.
+   - `apply_merge(proposal, graph)` creates a `synthesis` node with
+     `merges-into` edges from each source. `info_value` inherits
+     max(sources.info_value) + 1 if multi-axis.
+   - Autopilot scans every N ticks and surfaces proposals via
+     `progress.log`; no auto-apply (the human decides whether to merge).
+
+6. **Event-log scheduler (poll-light).** `scheduler.py` maintains
+   `.research-tree/events.log` and `scheduler_cursor.txt`. Autopilot's
+   per-tick "what changed?" is a cursor-bounded log read, not a tree
+   re-scan. `Scheduler.scan_branches()` walks `branches/*` and emits
+   synthetic `background_process_exit` / `result_md_written` /
+   `dead_md_written` events. inotify is intentionally NOT a dependency
+   (v1.1).
+
+### Preserved invariants (will not be regressed)
+
+- Physical-evidence trust kernel (`charter_validator.py` runs as a
+  subprocess from `Worker.validate()`).
+- AUDIT_NONCE + challenge-fragment cross-check for codex audits.
+- Fail-CLOSED on codex audit unreachable.
+- Single-step autopilot (no in-prompt for-loops; main context stays
+  bounded).
+- Dead branches as deliverables (FINAL_REPORT dead-branch atlas).
+- Anti-fabrication contract from v0.4 (subagents cannot pass validator
+  by writing fake RESULT.md text).
+
+### Migration (zero-friction)
+
+- Any v1.0 CLI invocation auto-migrates `tree.json` → `graph.json` on
+  first read. The migration is logged to stderr.
+- The v0.5 `tree.json` is preserved on disk read-only after migration.
+- The v0.5 `scripts/tree_state.py` (2233 lines) becomes a 20-line shim
+  importing `research_tree.cli:main`. The old implementation is parked
+  at `scripts/tree_state_v05_legacy.py` (still imported by `Worker.validate`
+  via subprocess until v1.1).
+- sc-bias 16-node tree migrated end-to-end with zero data loss:
+  completed-node scores (1786 / 1047 / 8M) and dead-node death_reason
+  all preserved; parent-of and dependency edges reconstructed.
+
+### Files added
+
+- `research_tree/__init__.py`
+- `research_tree/graph.py` — Node / Edge / Graph data model
+- `research_tree/migrator.py` — v0.5 → v1.0 conversion
+- `research_tree/branching_decider.py` — structured fork decisions
+- `research_tree/node_merger.py` — sibling complementarity detection
+- `research_tree/scheduler.py` — event log + branch scanner
+- `research_tree/cli.py` — thin CLI shell (replaces v0.5 tree_state.py)
+- `research_tree/workers/{base,training,audit,analysis,data_acquisition,framing_decision}.py`
+- `docs/V1-ARCHITECTURE.md` — the design contract this release implements
+
+### Files demoted
+
+- `scripts/tree_state.py` (2233 → 20 lines)
+- `scripts/tree_state_v05_legacy.py` (renamed from above; kept read-only)
+- `skills/research-tree/SKILL.md` (1042 → 250 lines)
+
+### NOT in v1.0 (deferred to v1.1)
+
+- Real inotify scheduler (current `Scheduler.scan_branches` is a
+  poll-on-demand watcher; the cursor-based event read is event-driven
+  but the scan is not).
+- Migrating `charter_validator.py`'s check_* function bodies in-tree
+  (currently called via subprocess from `Worker.validate`).
+- The 21 other items previously in `memory/future_roadmap.md` P2.
+
+— Claude, 2026-05-26, under Lily's "from-architecture-not-patches" mandate.
+
 ## [0.4.0] — 2026-05-25
 
 Quality-first release: closes every "known limitation" the v0.3.1 release left

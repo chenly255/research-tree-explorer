@@ -3,6 +3,90 @@
 > 每个版本为什么这么做. 怀疑某个 patch 该不该撤回时, 来这里查原委。
 > 新决策按倒序追加 (最新在顶部)。
 
+## 2026-05-26 — v1.0.0: 架构重写, 把 13 层补丁合并为 6 条结构改动
+
+**决策**: Lily 给了"不要打补丁, 从架构层面优化"指令 + DESIGN-PRINCIPLES.md 解冻。
+执行完整 v1.0 重写, 六个结构问题全做掉。Worker 接口 / 事件驱动 / SKILL.md 砍到 300 行
+全部落地。一天密集工作 17k 行新代码 + 旧 5000 行降级为兼容层。
+
+**触发**: Lily 看完 sc-bias 节点 1.3 / 1.4 出现"实质重复的 fork"现象后说
+"避免再出现像之前sc-bias一样 在没什么意义的事情上做分叉". 她明确要求**不要再加补丁**,
+从根本上解决两个痛点 (智能分叉 + 节点合并) + 整体架构升级。"等优化完了 提交到云端
+同步 然后我再开始sc-bias" 表明她接受重写带来的工具停机时间。
+
+**做了什么 (六条架构改动, 全部完成)**:
+
+1. **Edges 一等对象**: 节点不再持有 `parent / children / depends_on /
+   depends_on_soft / parallel_group` 字段. 所有关系走 `Edge(src, dst, kind)`,
+   kind ∈ {`parent-of`, `hard-dep`, `soft-dep`, `merges-into`, `derived-from`,
+   `parallel-with`}. 关系查询从 `graph.children_of()` 等 helper 走, 不污染节点 schema.
+
+2. **Status 三轴正交**: 旧 6 值 enum (`pending / expanded / running / completed /
+   dead / abandoned`) 拆为 `lifecycle ∈ {created, running, done, failed}` +
+   `is_branched: bool` + `is_abandoned: bool`. 旧每个状态对应一个三元组组合.
+   不再因为加一个状态值就要改 N 个判断分支.
+
+3. **Worker 接口**: 每个 `task_type` 一个 Worker 子类
+   (`workers/{training, audit, analysis, data_acquisition, framing_decision}.py`),
+   各自封装 spawn_subagent_prompt + validate + on_completion. SKILL.md 不再
+   嵌入 task_type-specific artifact rules (1042 → 250 行, 76% 缩减).
+   增加第 6 种 task_type = 加一个 Worker 类, 不动 SKILL.md / CLI dispatcher.
+
+4. **BranchingDecider 智能分叉**: 替代 v0.5 proposer subagent 自由判断的
+   `skip_expansion` 字段. 两个 API:
+   - `decide_to_fork(parent)`: 在 proposer 调用前用结构化闸门 (cost-value /
+     depth 规则) 决定该不该 fork. 防止"没意义的分叉" 在 expand 阶段就被拦截.
+   - `decide_to_accept_candidate(cand, parent)`: 对 proposer 返回的每个候选
+     做相似度检查 + 显式 axis 重叠检查. cosine ≥ 0.85 → MERGE_WITH; axis
+     "X vs Y" 重叠 → REJECT.
+   - sc-bias 14/14 现有兄弟节点都正确 ADD (0 false positive), bit-identical
+     重复正确 MERGE_WITH, "GSVA vs AUCell" 重 fork 正确 REJECT.
+
+5. **NodeMerger 节点合并**: 全新功能, v0.5 完全没有.
+   `detect_merge_opportunities()` 扫完成兄弟节点, 用保守 regex whitelist
+   (atlas/cell_type/fm/metric/disease) 抽 axis 值, 至少一条 axis 互补
+   (jaccard ≤ 0.4) 即触发提议. `apply_merge()` 创建 synthesis 节点 +
+   双向 merges-into edges. autopilot 每 N 步扫一次, 落 proposal 到
+   progress.log 等 Lily 决定 apply.
+
+6. **事件日志 scheduler**: `events.log` 追加事件流, `scheduler_cursor.txt`
+   持久化游标. autopilot 每步只读 cursor delta, 不全树扫描. branch 扫描
+   合成 RESULT.md / DEAD.md / 后台进程死亡 等事件. 替代 v0.5 的 human-gate
+   auto-raise / auto-clear-if-stale polling. 不依赖 inotify (v1.1 再考虑).
+
+**关键工程纪律**:
+- 每写完一个模块, 立刻在 sc-bias 真实 16 节点树上跑端到端测试.
+- 迁移器写完后第一件事是 verify 已完成节点的 score / death_reason 全部保留.
+- 修任何东西先回 DESIGN-PRINCIPLES.md 看是否在解决六问题之一, 还是又在加补丁.
+
+**坚持没做 (Lily 红线 / 越级)**:
+- 自动写论文 (永远不做 — Lily 明确)
+- 走量 50 ideas (Sakana 模式不适合顶刊用例)
+- Co-Scientist Elo tournament (sc-bias 5 路径互补不竞争)
+- MCTS UCT (树深 ≤ 5, 边际收益)
+- 跨机器分布式 (用户基数 = 1)
+
+**v1.1 backlog**:
+- 真 inotify 调度 (现在 scheduler 是 poll-on-demand 事件源)
+- charter_validator.py check_* 函数体迁移进 Worker (现在还 subprocess 调用旧脚本)
+- v0.5 future_roadmap P2 列表里其他 21 项
+
+**未来回头看**:
+- Worker 接口 + 事件 log 模式后续应该让"加新 task_type"成为分钟级工作, 不再是
+  跨 4 个文件的改动. 这是 KISS 的核心收益.
+- BranchingDecider 在中文长描述上的相似度判断仍偏保守 (cosine 0.65-0.85 灰区
+  让它们 ADD, 由 NodeMerger 后续审). 实战 sc-bias 跑下来如果灰区误漏导致重复
+  工作, v1.1 可考虑加 codex 灰区兜底, 但默认不开 (避免 API 依赖污染纯度).
+
+**关于"重复 fork"为什么 v1.0 仍非 100% 拦截**: 静态文本相似度对中文+长描述
++ 共享父亲 vocabulary 的兄弟天生不灵敏. v1.0 的真正防线是: (a) `decide_to_fork`
+的 cost-value 闸门把"不值得 fork 的父节点"早早 DIRECT_EXECUTE; (b) proposer
+的结构化 constraints (must_diversify_axis / min_info_value=3) 在 prompt
+阶段就引导避开; (c) `decide_to_accept_candidate` 拦截 hard duplicate + axis
+explicit re-explore; (d) NodeMerger 后续扫描灰区. 四层组合比纯相似度判断稳健.
+
+---
+
 ## 2026-05-25 — v0.4.0: 质量第一模式 — 三轮 codex audit, 不留尾巴
 
 **决策**: Lily 触发 "质量第一" 模式 ("不要留尾巴 一起完善好"). v0.3.1 留下的 3 个

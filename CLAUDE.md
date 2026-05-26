@@ -18,15 +18,29 @@
 5. **autopilot 不停下问用户"该选哪条岔路"**. 技术分岔自决 (proposer + codex audit + signal_detector). 只有 framing / venue / 资源 (账号 / 钱 / >10GB 数据) 才升级到 Lily。
 6. **不抄走量, 抄精品**. Sakana 50 ideas / 走量取胜不抄. Co-Scientist Elo tournament 在我们用例 ROI 边际故意不抄. **抄什么 / 不抄什么 / 为什么** 都记在 `memory/competitor_analysis.md`, 改方向前看那里。
 
-## 当前状态 (2026-05-25 v0.3.0)
+## 当前状态 (2026-05-26 v1.0.0 — 架构重写完成)
 
-最新 commit: `e1d1717 v0.3.0 — sub-step checkpointing + fractal agent recursion`
+**v1.0.0 — Lily "从架构层面优化" 指令下的完整重写**. DESIGN-PRINCIPLES.md 六问题
+全部解决, 不再走 v0.5.x 补丁路线. 详 `CHANGELOG.md` + `memory/decisions.md` v1.0.0 条目.
 
-**已实现**: branch = Claude Code agent (4 输出模式 RESULT/DEAD/SUBTREE_FORK/SUBTREE_PIVOT) · AIDE 风格 2 次 repair retry · cascade-reap 防 zombie · backtrack / resume-branch / suggest-next · validator-repair cosmetic 自动修 · codex CLI fallback (不依赖 MCP) · LangGraph 风格 sub-step phase_log.jsonl checkpoint · 真 fractal agent (subagent 也能用 Agent 工具)
+**架构骨架**: `research_tree/` Python 包. SKILL.md 砍到 250 行 (从 1042 行).
+`scripts/tree_state.py` 是 20 行 shim, 旧 2233 行实现降级为 `scripts/tree_state_v05_legacy.py`.
 
-**故意没做** (低 ROI for Lily, 详 `memory/competitor_analysis.md`): Co-Scientist Elo tournament · Sakana MCTS UCB · Sakana 走量 50 ideas
+**v1.0 六条架构改动**:
+1. Edges 一等对象 (parent-of / hard-dep / soft-dep / merges-into / parallel-with)
+2. Status 三轴正交 (lifecycle / is_branched / is_abandoned)
+3. Worker 接口 (每 task_type 一个子类, artifact rules 离开 SKILL.md)
+4. BranchingDecider 智能分叉 (decide_to_fork + decide_to_accept_candidate, 替代 proposer 自由判断)
+5. NodeMerger 节点合并 (全新功能, v0.5 完全没有)
+6. 事件日志 scheduler (cursor delta 读, poll-light)
 
-**未实战验证**: SUBTREE_FORK + SUBTREE_PIVOT 路径 wired 了, 但没在真实 sc-bias 分支上跑过. 第一次实战在 sc-bias 节点 1.2/1.3/1.4 (训练 task) 上。
+**Lily 两个痛点都已解决**:
+- 智能分叉: 5 道闸门 + per-candidate 拦截 (depth / cost-value / hard-dup / axis-overlap / fallthrough)
+- 节点合并: detect-merges 命令扫互补兄弟, merge 创建 synthesis 节点 + merges-into edges
+
+**v1.0 验收**: sc-bias 16 节点端到端迁移成功, 0 数据丢失. 14/14 真兄弟 ADD, 0 false positive.
+
+**v1.1 backlog**: 真 inotify scheduler · charter_validator check_* 函数体进 Worker · 其他 P2 项.
 
 ## 文件地图 (按需检索)
 
@@ -38,23 +52,31 @@
 - `memory/future_roadmap.md` — 下一步往哪走, 按 ROI 排序
 - `memory/workflow.md` — Lily 的真实工作流 (sc-bias 是参考用例)
 
-代码 (`scripts/`):
-- `tree_state.py` — 核心状态机 + 24 个子命令
-- `charter_validator.py` — 物理产物校验 (validator pass 1 + 2)
-- `codex_audit_cli.py` — GPT-5.5 audit producer (MCP fallback)
-- `validator_repair.py` — cosmetic 自动修复 (charter 表头 / DATA_MANIFEST 别名 / requirements 合成)
-- `stale_running_handler.py` — 后台进程崩溃恢复 + phase_log 接续
-- `phase_checkpoint.py` — sub-step checkpointing (v0.3.0 新)
-- `signal_detector.py` — auto-pivot signal
-- `synthesize_report.py` — FINAL_REPORT 生成
+代码 (v1.0 `research_tree/` Python 包, 新主路径):
+- `research_tree/graph.py` — Node / Edge / Graph 数据模型 (单一真实来源)
+- `research_tree/migrator.py` — v0.5 tree.json → v1.0 graph.json (auto-trigger)
+- `research_tree/branching_decider.py` — 智能分叉决策 (Lily 痛点 1)
+- `research_tree/node_merger.py` — 节点合并 (Lily 痛点 2)
+- `research_tree/scheduler.py` — 事件日志 + 分支扫描
+- `research_tree/workers/` — task_type 特定 Worker 子类
+- `research_tree/cli.py` — 薄命令行入口
+
+代码 (v0.5 兼容层 `scripts/`, 部分仍在用):
+- `scripts/tree_state.py` — 20 行 shim → `research_tree.cli:main`
+- `scripts/tree_state_v05_legacy.py` — 旧 2233 行实现 (Worker.validate 仍调它)
+- `scripts/charter_validator.py` — 物理产物校验 (v1.1 移入 Worker)
+- `scripts/codex_audit_cli.py` — GPT-5.5 audit producer
+- `scripts/{validator_repair, stale_running_handler, phase_checkpoint, signal_detector, synthesize_report}.py` — v0.5 辅助脚本, 多数仍在用
 
 协议 (`skills/`):
-- `skills/research-tree/SKILL.md` — Claude Code 跑 autopilot 时读的协议 (~960 行, 必读)
+- `~/.claude/skills/research-tree/SKILL.md` — Claude Code 跑 autopilot 时读的协议 (250 行, 必读)
 
 设计文档:
-- `docs/ARCHITECTURE.md` — 三层架构 (skill / scripts / disk state)
-- `DESIGN-v0.2-AGENT-NODES.md` — v0.2 agent 节点重设计的来源 + 决策
-- `CHANGELOG.md` — 完整版本历史
+- `docs/V1-ARCHITECTURE.md` — v1.0 设计合同 (写代码前定稿, 写代码后不改)
+- `DESIGN-PRINCIPLES.md` — 六条结构问题 (v1.0 的输入)
+- `docs/ARCHITECTURE.md` — v0.5 历史参考 (不再编辑)
+- `DESIGN-v0.2-AGENT-NODES.md` — v0.2 来源
+- `CHANGELOG.md` — 完整版本历史 (v1.0.0 在顶部)
 - `CONTRIBUTING.md` — 怎么贡献
 
 参考:
